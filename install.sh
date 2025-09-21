@@ -236,78 +236,14 @@ info "SOPS key successfully copied to installed system"
 info "Updating hardware-configuration.nix..."
 cp /mnt/etc/nixos/hardware-configuration.nix ~/nixos-config/hosts/"$HOSTNAME"/hardware-configuration.nix
 
-# Setup Clevis for TPM auto-decryption BEFORE updating boot.nix
-CLEVIS_SUCCESS=false
-prompt "Do you want to enable TPM auto-decryption with Clevis? (y/N)"
-read -r ENABLE_CLEVIS
-
-if [[ "$ENABLE_CLEVIS" =~ ^[Yy]$ ]]; then
-    info "Checking TPM availability..."
-    
-    if [ ! -e /dev/tpm0 ] && [ ! -e /dev/tpmrm0 ]; then
-        warn "No TPM device found at /dev/tpm0 or /dev/tpmrm0"
-        warn "Available devices:"
-        ls -la /dev/tpm* 2>/dev/null || echo "No TPM devices found"
-        warn "Disabling Clevis setup."
-        ENABLE_CLEVIS="n"
-    else
-        info "TPM device found. Setting up Clevis..."
-        
-        # Try to set up Clevis and capture success/failure
-        if nix-shell -p clevis luksmeta cryptsetup tpm2-tools tpm2-tss --run "
-            set -e  # Exit on any error
-            
-            # Check TPM status
-            echo '=== TPM Status ==='
-            tpm2_getcap properties-fixed 2>&1 || {
-                echo 'ERROR: Could not get TPM capabilities'
-                exit 1
-            }
-            
-            echo '=== Binding LUKS to TPM2 ==='
-            echo -n '$ENCRYPTION_PASSWORD' | clevis luks bind -d '$ROOT_PART' tpm2 '{}' -y 2>&1 || {
-                echo 'ERROR: Failed to bind LUKS to TPM2'
-                exit 1
-            }
-            
-            # Verify the binding
-            echo '=== Verifying Clevis binding ==='
-            cryptsetup luksDump '$ROOT_PART' | grep -i clevis || {
-                echo 'ERROR: Clevis token not found in luksDump'
-                exit 1
-            }
-            
-            echo 'Successfully bound LUKS to TPM2'
-        "; then
-            info "Clevis TPM binding complete!"
-            CLEVIS_SUCCESS=true
-        else
-            warn "Clevis setup failed. Common causes:"
-            warn "  - TPM is disabled in BIOS"
-            warn "  - TPM is owned by another OS"
-            warn "  - TPM2 tools version mismatch"
-            warn "  - Secure Boot interference"
-            warn "Continuing without auto-decryption..."
-            ENABLE_CLEVIS="n"
-            CLEVIS_SUCCESS=false
-        fi
-    fi
-else
-    info "Skipping Clevis setup. You'll need to enter encryption password on boot."
-fi
-
-# Find and update boot.nix based on whether Clevis succeeded
+# Find and update boot.nix
 info "Finding boot.nix..."
 BOOT_NIX=$(find ~/nixos-config/hosts/"$HOSTNAME" -name "boot.nix" -type f | head -n 1)
 
 [ -n "$BOOT_NIX" ] || error "boot.nix not found in ~/nixos-config/hosts/$HOSTNAME"
 
 info "Updating boot.nix at $BOOT_NIX..."
-
-# Generate boot.nix with conditional Clevis configuration
-if [[ "$CLEVIS_SUCCESS" == "true" ]]; then
-    info "Generating boot.nix with Clevis auto-decryption enabled"
-    cat > "$BOOT_NIX" << EOF
+cat > "$BOOT_NIX" << EOF
 # /hosts/$HOSTNAME/boot.nix
 let
   # The NEW, CORRECT values from your fresh install
@@ -321,56 +257,135 @@ in {
     }
   ];
 
-  # This block enables both manual LUKS and Clevis auto-decryption
+  # This block is all you need. Your custom module will read this
+  # and generate the correct boot.initrd.luks.devices and boot.initrd.clevis.devices.
   custom.boot.luksPartitions = {
     root = {
       luksName = ${HOSTNAME}RootLuksName;
       devicePath = ${HOSTNAME}RootLuksDevicePath;
-      clevisEnabled = true;  # Enable Clevis auto-decryption
     };
   };
 }
 EOF
-else
-    info "Generating boot.nix with manual LUKS decryption only"
-    cat > "$BOOT_NIX" << EOF
-# /hosts/$HOSTNAME/boot.nix
-let
-  # The NEW, CORRECT values from your fresh install
-  ${HOSTNAME}RootLuksName = "$LUKS_NAME";
-  ${HOSTNAME}RootLuksDevicePath = "/dev/disk/by-uuid/$ROOT_UUID";
-in {
-  swapDevices = [
-    {
-      device = "/swapfile";
-      size = $((SWAP_GB * 1024));  # Size in MB
-    }
-  ];
-
-  # This block enables manual LUKS decryption only
-  custom.boot.luksPartitions = {
-    root = {
-      luksName = ${HOSTNAME}RootLuksName;
-      devicePath = ${HOSTNAME}RootLuksDevicePath;
-      clevisEnabled = false;  # Disable Clevis auto-decryption
-    };
-  };
-}
-EOF
-fi
 
 info "boot.nix updated successfully!"
 
+# Setup Clevis for TPM auto-decryption
+prompt "Do you want to enable TPM auto-decryption with Clevis? (y/N)"
+read -r ENABLE_CLEVIS
+
+CLEVIS_BOUND=false
+
+if [[ "$ENABLE_CLEVIS" =~ ^[Yy]$ ]]; then
+    info "Checking TPM availability..."
+    
+    # Check if TPM devices exist and are accessible
+    TPM_AVAILABLE=false
+    if [ -e /dev/tpm0 ]; then
+        if [ -r /dev/tpm0 ] && [ -w /dev/tpm0 ]; then
+            TPM_AVAILABLE=true
+            info "Found accessible TPM at /dev/tpm0"
+        else
+            warn "TPM at /dev/tpm0 exists but is not readable/writable"
+        fi
+    elif [ -e /dev/tpmrm0 ]; then
+        if [ -r /dev/tpmrm0 ] && [ -w /dev/tpmrm0 ]; then
+            TPM_AVAILABLE=true
+            info "Found accessible TPM at /dev/tpmrm0"
+        else
+            warn "TPM at /dev/tpmrm0 exists but is not readable/writable"
+            # Try to fix permissions
+            info "Attempting to fix TPM permissions..."
+            chmod 666 /dev/tpmrm0 2>/dev/null || warn "Could not fix TPM permissions"
+            if [ -r /dev/tpmrm0 ] && [ -w /dev/tpmrm0 ]; then
+                TPM_AVAILABLE=true
+                info "TPM permissions fixed"
+            fi
+        fi
+    else
+        warn "No TPM devices found"
+        ls -la /dev/tpm* 2>/dev/null || echo "No TPM devices available"
+    fi
+
+    if [ "$TPM_AVAILABLE" = false ]; then
+        warn "TPM is not available or accessible. Skipping Clevis setup."
+        warn "This could be because:"
+        warn "  - TPM is disabled in BIOS"
+        warn "  - TPM resource manager is not running"
+        warn "  - Permission issues in live environment"
+    else
+        info "TPM is available. Setting up Clevis..."
+        
+        # Create dummy secret first (your config expects this file to exist)
+        mkdir -p /mnt/etc/clevis-secrets
+        
+        # Create a dummy secret that we'll encrypt with TPM
+        DUMMY_SECRET="nixos-boot-secret-$(date +%s)"
+        
+        # Try to encrypt the dummy secret and bind LUKS
+        nix-shell -p clevis luksmeta cryptsetup tpm2-tools tpm2-tss --run "
+            set -e
+            
+            echo '=== Testing TPM access ==='
+            tpm2_pcrread sha256:7 || echo 'Warning: Could not read PCR 7'
+            
+            echo '=== Creating encrypted secret for boot ==='
+            # Create the JWE file that your config expects
+            echo -n '$DUMMY_SECRET' | clevis encrypt tpm2 '{}' > /mnt/etc/clevis-secrets/secret.jwe
+            
+            if [ ! -s /mnt/etc/clevis-secrets/secret.jwe ]; then
+                echo 'ERROR: Failed to create JWE secret file'
+                exit 1
+            fi
+            
+            echo 'JWE secret file created successfully'
+            
+            echo '=== Binding LUKS partition to TPM ==='
+            # Now bind the LUKS partition
+            echo -n '$ENCRYPTION_PASSWORD' | clevis luks bind -d '$ROOT_PART' tpm2 '{}' -y
+            
+            echo 'LUKS binding successful'
+            
+        " && {
+            CLEVIS_BOUND=true
+            info "Clevis setup complete!"
+            info "Created JWE secret at /etc/clevis-secrets/secret.jwe"
+            info "Bound LUKS partition to TPM"
+        } || {
+            warn "Clevis setup failed. Creating fallback configuration..."
+            
+            # Create a placeholder JWE file so the build doesn't fail
+            mkdir -p /mnt/etc/clevis-secrets
+            echo '{"placeholder":"true"}' > /mnt/etc/clevis-secrets/secret.jwe
+            
+            warn "Created placeholder JWE file to allow build to complete"
+            warn "You'll need to set up Clevis manually after first boot"
+        }
+    fi
+else
+    info "Skipping Clevis setup."
+    
+    # Still need to create the directory structure so the build doesn't fail
+    mkdir -p /mnt/etc/clevis-secrets
+    echo '{"disabled":"true"}' > /mnt/etc/clevis-secrets/secret.jwe
+    info "Created placeholder JWE file (Clevis disabled)"
+fi
+
 # Install NixOS
-info "Installing NixOS with flake configuration..."
+info "Installing NixOS with fl ake configuration..."
 info "This may take a while..."
 
 nixos-install --flake ~/nixos-config#"$HOSTNAME" --root /mnt --no-root-passwd 2>&1 || {
-    error "nixos-install failed! Check the error messages above. Common issues:
-    - SOPS decryption failed (check age key)
-    - Flake evaluation error (syntax error in configs)
-    - Missing dependencies in flake
-    - Clevis configuration mismatch"
+    error "nixos-install failed! Check the error messages above.
+    
+Check if these files exist:
+  - /mnt/root/.config/sops/age/keys.txt ($([ -f /mnt/root/.config/sops/age/keys.txt ] && echo "✓ exists" || echo "✗ missing"))
+  - /mnt/etc/clevis-secrets/secret.jwe ($([ -f /mnt/etc/clevis-secrets/secret.jwe ] && echo "✓ exists" || echo "✗ missing"))
+    
+Common issues:
+  - SOPS decryption failed (check age key)
+  - Flake evaluation error (syntax error in configs)  
+  - Missing clevis secrets"
 }
 
 # Set passwords
@@ -396,6 +411,46 @@ cp -r ~/nixos-config /mnt/root/nixos-config
 mkdir -p /mnt/home/"$REGULAR_USER"/.config/sops/age
 cp /root/.config/sops/age/keys.txt /mnt/home/"$REGULAR_USER"/.config/sops/age/keys.txt
 nixos-enter --root /mnt -c "chown -R $REGULAR_USER:users /home/$REGULAR_USER/.config" 2>/dev/null || true
+
+# Create post-install clevis setup script if needed
+if [ "$CLEVIS_BOUND" != true ]; then
+    cat > /mnt/root/setup-clevis.sh << EOF
+#!/usr/bin/env bash
+# Run this after first boot to set up Clevis TPM auto-decryption properly
+
+echo "Setting up Clevis for TPM auto-decryption..."
+
+# Create proper secret
+BOOT_SECRET="nixos-boot-secret-\$(date +%s)"
+
+# Encrypt the secret with TPM
+echo -n "\$BOOT_SECRET" | clevis encrypt tpm2 '{}' > /etc/clevis-secrets/secret.jwe && {
+    echo "Created new JWE secret file"
+} || {
+    echo "Failed to create JWE secret"
+    exit 1
+}
+
+# Bind LUKS partition to TPM
+echo "Please enter your disk encryption password:"
+clevis luks bind -d $ROOT_PART tpm2 '{}' && {
+    echo "Success! LUKS partition bound to TPM"
+    echo "Auto-decryption should work on next boot"
+    
+    # Test decryption
+    echo "Testing auto-decryption..."
+    clevis luks unlock -d $ROOT_PART && {
+        echo "Auto-decryption test successful!"
+    } || {
+        echo "Auto-decryption test failed"
+    }
+} || {
+    echo "Failed to bind LUKS partition"
+    exit 1
+}
+EOF
+    chmod +x /mnt/root/setup-clevis.sh
+fi
 
 # Setup git for SSH (reminder)
 cat > /mnt/root/setup-git-ssh.sh << 'EOF'
@@ -427,19 +482,22 @@ Root Partition: $ROOT_PART
 Root UUID: $ROOT_UUID
 LUKS Name: $LUKS_NAME
 Swap Size: ${SWAP_GB}GB
-Clevis Enabled: $CLEVIS_SUCCESS
+Clevis Bound: ${CLEVIS_BOUND}
 
-SOPS Key Location: /root/.config/sops/age/keys.txt
-Config Location: /root/nixos-config
+Files created:
+- SOPS Key: /root/.config/sops/age/keys.txt
+- Clevis Secret: /etc/clevis-secrets/secret.jwe
+- Config: /root/nixos-config
 
-If boot fails, check:
-1. SOPS key is present and correct
-2. LUKS can be decrypted manually
-3. Boot loader was installed correctly
+$(if [ "$CLEVIS_BOUND" != true ]; then
+    echo "Clevis was NOT properly set up during install."
+    echo "A placeholder JWE file was created to allow the build to complete."
+    echo "To enable auto-decryption, run: sudo /root/setup-clevis.sh"
+else
+    echo "Clevis auto-decryption should be working."
+fi)
 
-To manually decrypt: cryptsetup open /dev/disk/by-uuid/$ROOT_UUID cryptroot
-
-Boot configuration: $([ "$CLEVIS_SUCCESS" == "true" ] && echo "Auto-decryption enabled" || echo "Manual decryption only")
+Manual unlock command: cryptsetup open /dev/disk/by-uuid/$ROOT_UUID cryptroot
 EOF
 
 info ""
@@ -452,22 +510,16 @@ info "  - Hostname: $HOSTNAME"
 info "  - Encrypted root: $ROOT_PART (UUID: $ROOT_UUID)"
 info "  - LUKS name: $LUKS_NAME"
 info "  - Swap file: ${SWAP_GB}GB"
-if [[ "$CLEVIS_SUCCESS" == "true" ]]; then
-    info "  - TPM auto-decryption: Successfully enabled"
+if [ "$CLEVIS_BOUND" = true ]; then
+    info "  - TPM auto-decryption: ENABLED ✓"
 else
-    info "  - TPM auto-decryption: Disabled (manual password entry required)"
+    info "  - TPM auto-decryption: PLACEHOLDER CREATED"
+    info "    Run 'sudo /root/setup-clevis.sh' after first boot"
 fi
 info "  - SOPS key: /root/.config/sops/age/keys.txt"
+info "  - Clevis secret: /etc/clevis-secrets/secret.jwe"
 info ""
 info "Installation details saved to /root/install-info.txt"
-info ""
-info "Next steps:"
-info "  1. Reboot into your new system"
-if [[ "$CLEVIS_SUCCESS" != "true" ]]; then
-    info "  2. Enter your encryption password when prompted"
-fi
-info "  2. Run: sudo /root/setup-git-ssh.sh"
-info "  3. Check /root/install-info.txt for details"
 info ""
 
 prompt "Press Enter to reboot or Ctrl+C to stay in live environment..."
