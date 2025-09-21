@@ -32,33 +32,47 @@ echo "  NixOS Installation Script"
 echo "=================================="
 echo -e "${NC}"
 
-# Prompt for GitHub repo
-prompt "Enter your GitHub repo URL (HTTPS):"
-read -r GITHUB_REPO
+# Prompt for GitHub username (construct full URL)
+prompt "Enter your GitHub username:"
+read -r GITHUB_USERNAME
+GITHUB_REPO="https://github.com/${GITHUB_USERNAME}/nixos-config"
+info "Will clone from: $GITHUB_REPO"
 
 # Prompt for hostname
 prompt "Enter hostname for this machine:"
 read -r HOSTNAME
 
-# Prompt for user password
-prompt "Enter password for your user (will also be used for root):"
-read -sr USER_PASSWORD
-echo
-prompt "Confirm password:"
-read -sr USER_PASSWORD_CONFIRM
-echo
+# Prompt for user password with retry logic
+while true; do
+    prompt "Enter password for your user (will also be used for root):"
+    read -sr USER_PASSWORD
+    echo
+    prompt "Confirm password:"
+    read -sr USER_PASSWORD_CONFIRM
+    echo
+    
+    if [ "$USER_PASSWORD" = "$USER_PASSWORD_CONFIRM" ]; then
+        break
+    else
+        warn "Passwords do not match! Please try again."
+    fi
+done
 
-[ "$USER_PASSWORD" = "$USER_PASSWORD_CONFIRM" ] || error "Passwords do not match!"
-
-# Prompt for encryption password
-prompt "Enter disk encryption password:"
-read -sr ENCRYPTION_PASSWORD
-echo
-prompt "Confirm encryption password:"
-read -sr ENCRYPTION_PASSWORD_CONFIRM
-echo
-
-[ "$ENCRYPTION_PASSWORD" = "$ENCRYPTION_PASSWORD_CONFIRM" ] || error "Encryption passwords do not match!"
+# Prompt for encryption password with retry logic
+while true; do
+    prompt "Enter disk encryption password:"
+    read -sr ENCRYPTION_PASSWORD
+    echo
+    prompt "Confirm encryption password:"
+    read -sr ENCRYPTION_PASSWORD_CONFIRM
+    echo
+    
+    if [ "$ENCRYPTION_PASSWORD" = "$ENCRYPTION_PASSWORD_CONFIRM" ]; then
+        break
+    else
+        warn "Encryption passwords do not match! Please try again."
+    fi
+done
 
 # Detect and select disk
 info "Available disks:"
@@ -129,7 +143,7 @@ nixos-generate-config --root /mnt
 
 # Clone nixos-config
 info "Cloning nixos-config from $GITHUB_REPO..."
-git clone "$GITHUB_REPO" ~/nixos-config
+git clone "$GITHUB_REPO" ~/nixos-config || error "Failed to clone repository. Check your username and network connection."
 
 # Check hostname directory exists
 [ -d ~/nixos-config/hosts/"$HOSTNAME" ] || error "No configuration found for hostname '$HOSTNAME' in ~/nixos-config/hosts/"
@@ -139,70 +153,84 @@ info "Found configuration for $HOSTNAME"
 # Setup rbw and extract SOPS key
 info "Setting up rbw for SOPS key extraction..."
 
-# Get Bitwarden credentials upfront
-prompt "Enter your Bitwarden email:"
-read -r RBW_EMAIL
+# Set up environment for rbw in the live USB
+export GPG_TTY=$(tty)
+export DISPLAY=:0
 
-prompt "Are you using a self-hosted Bitwarden? (y/N)"
-read -r SELF_HOSTED
+# Configure and use rbw with retry logic
+RBW_SUCCESS=false
+RBW_RETRIES=0
+MAX_RBW_RETRIES=3
 
-if [[ "$SELF_HOSTED" =~ ^[Yy]$ ]]; then
-    prompt "Enter base URL:"
-    read -r BASE_URL
-else
-    BASE_URL=""
-fi
-
-prompt "Enter your Bitwarden master password:"
-read -sr BITWARDEN_PASSWORD
-echo
-
-# Configure and use rbw with proper pinentry setup
-nix-shell -p rbw pinentry-curses --run "
-    set -e
-    
-    # Set up pinentry
-    export GPG_TTY=\$(tty)
-    export PINENTRY_USER_DATA='USE_CURSES=1'
-    
-    echo '=== Configuring rbw ==='
-    rbw config set email '$RBW_EMAIL'
-    rbw config set pinentry pinentry-curses
-    
-    if [ -n '$BASE_URL' ]; then
-        rbw config set base_url '$BASE_URL'
-    fi
-    
-    echo '=== Logging into rbw ==='
-    echo '$BITWARDEN_PASSWORD' | rbw login
-    
-    echo '=== Unlocking rbw ==='
-    echo '$BITWARDEN_PASSWORD' | rbw unlock
-    
-    echo '=== Syncing with server ==='
-    rbw sync
-    
-    echo '=== Extracting NixOS AGE Key ==='
-    mkdir -p /root/.config/sops/age
-    rbw get 'NixOS AGE Key' > /root/.config/sops/age/keys.txt
-    chmod 600 /root/.config/sops/age/keys.txt
-    
-    # Verify the key was extracted
-    if [ ! -s /root/.config/sops/age/keys.txt ]; then
-        echo 'ERROR: SOPS key file is empty!'
-        exit 1
-    fi
-    
-    echo 'SOPS key extracted successfully!'
-    
-    # Lock rbw when done
-    rbw lock
-" || error "Failed to setup rbw and extract SOPS key. Cannot continue."
+while [ "$RBW_SUCCESS" = false ] && [ $RBW_RETRIES -lt $MAX_RBW_RETRIES ]; do
+    nix-shell -p rbw pinentry-curses gnupg --run '
+        # Configure GPG to use curses pinentry
+        mkdir -p ~/.gnupg
+        echo "pinentry-program $(which pinentry-curses)" > ~/.gnupg/gpg-agent.conf
+        
+        # Kill any existing gpg-agent to force reload of config
+        pkill gpg-agent 2>/dev/null || true
+        
+        if [ ! -f ~/.config/rbw/config.json ]; then
+            echo "=== Configuring rbw ==="
+            echo "Enter your Bitwarden email:"
+            read -r RBW_EMAIL
+            rbw config set email "$RBW_EMAIL"
+            
+            echo "Are you using a self-hosted Bitwarden? (y/N)"
+            read -r SELF_HOSTED
+            if [[ "$SELF_HOSTED" =~ ^[Yy]$ ]]; then
+                echo "Enter base URL:"
+                read -r BASE_URL
+                rbw config set base_url "$BASE_URL"
+            fi
+            
+            # Set pinentry to curses for rbw
+            rbw config set pinentry pinentry-curses
+            
+            echo "=== Logging into rbw ==="
+            rbw login || exit 1
+        fi
+        
+        echo "=== Unlocking rbw ==="
+        rbw unlock || exit 1
+        
+        echo "=== Extracting NixOS AGE Key ==="
+        mkdir -p /root/.config/sops/age
+        rbw get "NixOS AGE Key" > /root/.config/sops/age/keys.txt || exit 1
+        chmod 600 /root/.config/sops/age/keys.txt
+        
+        # Verify the key was extracted
+        if [ ! -s /root/.config/sops/age/keys.txt ]; then
+            echo "ERROR: SOPS key file is empty!"
+            exit 1
+        fi
+        
+        echo "SOPS key extracted successfully!"
+    ' && RBW_SUCCESS=true || {
+        RBW_RETRIES=$((RBW_RETRIES + 1))
+        if [ $RBW_RETRIES -lt $MAX_RBW_RETRIES ]; then
+            warn "Failed to unlock rbw or extract key. Attempt $RBW_RETRIES of $MAX_RBW_RETRIES. Please try again."
+        else
+            error "Failed to setup rbw and extract SOPS key after $MAX_RBW_RETRIES attempts. Cannot continue."
+        fi
+    }
+done
 
 # Verify SOPS key exists and is valid
 info "Verifying SOPS key..."
 [ -s /root/.config/sops/age/keys.txt ] || error "SOPS key file is missing or empty!"
-info "SOPS key verified!"
+info "SOPS key verified at /root/.config/sops/age/keys.txt"
+
+# Copy SOPS key to the mounted system BEFORE nixos-install
+info "Copying SOPS key to installed system at /mnt/root/.config/sops/age/keys.txt..."
+mkdir -p /mnt/root/.config/sops/age
+cp /root/.config/sops/age/keys.txt /mnt/root/.config/sops/age/keys.txt
+chmod 600 /mnt/root/.config/sops/age/keys.txt
+
+# Verify it was copied
+[ -s /mnt/root/.config/sops/age/keys.txt ] || error "Failed to copy SOPS key to installed system!"
+info "SOPS key successfully copied to installed system"
 
 # Update hardware-configuration.nix
 info "Updating hardware-configuration.nix..."
@@ -242,20 +270,53 @@ EOF
 
 info "boot.nix updated successfully!"
 
-# Optional: Setup Clevis for TPM auto-decryption
+# Setup Clevis for TPM auto-decryption
 prompt "Do you want to enable TPM auto-decryption with Clevis? (y/N)"
 read -r ENABLE_CLEVIS
 
 if [[ "$ENABLE_CLEVIS" =~ ^[Yy]$ ]]; then
-    info "Setting up Clevis for TPM-based auto-decryption..."
+    info "Checking TPM availability..."
     
-    # Check if TPM is available
     if [ ! -e /dev/tpm0 ] && [ ! -e /dev/tpmrm0 ]; then
-        warn "No TPM device found. Skipping Clevis setup."
+        warn "No TPM device found at /dev/tpm0 or /dev/tpmrm0"
+        warn "Available devices:"
+        ls -la /dev/tpm* 2>/dev/null || echo "No TPM devices found"
+        warn "Skipping Clevis setup."
     else
-        nix-shell -p clevis luksmeta cryptsetup tpm2-tools --run "
-            echo -n '$ENCRYPTION_PASSWORD' | clevis luks bind -d '$ROOT_PART' tpm2 '{}' -y
-        " && info "Clevis TPM binding complete!" || warn "Clevis setup failed, continuing without auto-decryption"
+        info "TPM device found. Setting up Clevis..."
+        
+        # More detailed clevis setup with error output
+        nix-shell -p clevis luksmeta cryptsetup tpm2-tools tpm2-tss --run "
+            set -x  # Enable debug output
+            
+            # Check TPM status
+            echo '=== TPM Status ==='
+            tpm2_getcap properties-fixed 2>&1 || echo 'Warning: Could not get TPM capabilities'
+            
+            echo '=== Binding LUKS to TPM2 ==='
+            echo -n '$ENCRYPTION_PASSWORD' | clevis luks bind -d '$ROOT_PART' tpm2 '{}' -y 2>&1
+            
+            BIND_RESULT=\$?
+            if [ \$BIND_RESULT -eq 0 ]; then
+                echo 'Successfully bound LUKS to TPM2'
+                
+                # Verify the binding
+                echo '=== Verifying Clevis binding ==='
+                cryptsetup luksDump '$ROOT_PART' | grep -i clevis || echo 'Warning: Clevis token not found in luksDump'
+                
+                exit 0
+            else
+                echo 'ERROR: Failed to bind LUKS to TPM2 (exit code: '\$BIND_RESULT')'
+                exit 1
+            fi
+        " && info "Clevis TPM binding complete!" || {
+            warn "Clevis setup failed with detailed errors above."
+            warn "Common causes:"
+            warn "  - TPM is disabled in BIOS"
+            warn "  - TPM is owned by another OS"
+            warn "  - TPM2 tools version mismatch"
+            warn "Continuing without auto-decryption..."
+        }
     fi
 else
     info "Skipping Clevis setup. You'll need to enter encryption password on boot."
@@ -263,13 +324,20 @@ fi
 
 # Install NixOS
 info "Installing NixOS with flake configuration..."
-nixos-install --flake ~/nixos-config#"$HOSTNAME" --root /mnt --no-root-passwd || error "nixos-install failed!"
+info "This may take a while..."
+
+nixos-install --flake ~/nixos-config#"$HOSTNAME" --root /mnt --no-root-passwd 2>&1 || {
+    error "nixos-install failed! Check the error messages above. Common issues:
+    - SOPS decryption failed (check age key)
+    - Flake evaluation error (syntax error in configs)
+    - Missing dependencies in flake"
+}
 
 # Set passwords
 info "Setting passwords..."
 echo "root:$USER_PASSWORD" | nixos-enter --root /mnt -c 'chpasswd'
 
-# Determine your regular username (we need to prompt for it)
+# Determine your regular username
 prompt "Enter your regular username (not root):"
 read -r REGULAR_USER
 
@@ -284,11 +352,10 @@ nixos-enter --root /mnt -c "chown -R $REGULAR_USER:users /home/$REGULAR_USER/nix
 # Also copy to root
 cp -r ~/nixos-config /mnt/root/nixos-config
 
-# Copy SOPS key to installed system
-info "Copying SOPS key to installed system..."
-mkdir -p /mnt/root/.config/sops/age
-cp /root/.config/sops/age/keys.txt /mnt/root/.config/sops/age/keys.txt
-chmod 600 /mnt/root/.config/sops/age/keys.txt
+# Copy SOPS key to user's home if they need it
+mkdir -p /mnt/home/"$REGULAR_USER"/.config/sops/age
+cp /root/.config/sops/age/keys.txt /mnt/home/"$REGULAR_USER"/.config/sops/age/keys.txt
+nixos-enter --root /mnt -c "chown -R $REGULAR_USER:users /home/$REGULAR_USER/.config" 2>/dev/null || true
 
 # Setup git for SSH (reminder)
 cat > /mnt/root/setup-git-ssh.sh << 'EOF'
@@ -309,6 +376,30 @@ fi
 EOF
 chmod +x /mnt/root/setup-git-ssh.sh
 
+# Create debug info file
+cat > /mnt/root/install-info.txt << EOF
+NixOS Installation Information
+==============================
+Date: $(date)
+Hostname: $HOSTNAME
+Disk: $DISK
+Root Partition: $ROOT_PART
+Root UUID: $ROOT_UUID
+LUKS Name: $LUKS_NAME
+Swap Size: ${SWAP_GB}GB
+Clevis Enabled: ${ENABLE_CLEVIS:-N}
+
+SOPS Key Location: /root/.config/sops/age/keys.txt
+Config Location: /root/nixos-config
+
+If boot fails, check:
+1. SOPS key is present and correct
+2. LUKS can be decrypted manually
+3. Boot loader was installed correctly
+
+To manually decrypt: cryptsetup open /dev/disk/by-uuid/$ROOT_UUID cryptroot
+EOF
+
 info ""
 info "======================================"
 info "  Installation Complete!"
@@ -320,10 +411,13 @@ info "  - Encrypted root: $ROOT_PART (UUID: $ROOT_UUID)"
 info "  - LUKS name: $LUKS_NAME"
 info "  - Swap file: ${SWAP_GB}GB"
 if [[ "$ENABLE_CLEVIS" =~ ^[Yy]$ ]]; then
-    info "  - TPM auto-decryption: Enabled"
+    info "  - TPM auto-decryption: Attempted (check warnings above)"
 else
     info "  - TPM auto-decryption: Disabled"
 fi
+info "  - SOPS key: /root/.config/sops/age/keys.txt"
+info ""
+info "Installation details saved to /root/install-info.txt"
 info ""
 info "Next steps:"
 info "  1. Reboot into your new system"
@@ -331,9 +425,9 @@ if [[ ! "$ENABLE_CLEVIS" =~ ^[Yy]$ ]]; then
     info "  2. Enter your encryption password when prompted"
 fi
 info "  2. Run: sudo /root/setup-git-ssh.sh"
-info "  3. Verify your system boots correctly"
+info "  3. Check /root/install-info.txt for details"
 info ""
 
-prompt "Press Enter to reboot or Ctrl+C to cancel..."
+prompt "Press Enter to reboot or Ctrl+C to stay in live environment..."
 read -r
 reboot
