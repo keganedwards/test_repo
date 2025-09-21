@@ -139,44 +139,52 @@ info "Found configuration for $HOSTNAME"
 # Setup rbw and extract SOPS key
 info "Setting up rbw for SOPS key extraction..."
 
-# Set up environment for rbw in the live USB
-export GPG_TTY=$(tty)
-export DISPLAY=:0  # In case we're in a graphical environment
+# Get Bitwarden credentials upfront
+prompt "Enter your Bitwarden email:"
+read -r RBW_EMAIL
 
-# Configure rbw with proper pinentry
-nix-shell -p rbw pinentry-curses gnupg --run "
-    # Configure GPG to use curses pinentry
-    mkdir -p ~/.gnupg
-    echo 'pinentry-program $(which pinentry-curses)' > ~/.gnupg/gpg-agent.conf
+prompt "Are you using a self-hosted Bitwarden? (y/N)"
+read -r SELF_HOSTED
+
+if [[ "$SELF_HOSTED" =~ ^[Yy]$ ]]; then
+    prompt "Enter base URL:"
+    read -r BASE_URL
+else
+    BASE_URL=""
+fi
+
+prompt "Enter your Bitwarden master password:"
+read -sr BITWARDEN_PASSWORD
+echo
+
+# Configure and use rbw with proper pinentry setup
+nix-shell -p rbw pinentry-curses --run "
+    set -e
     
-    # Kill any existing gpg-agent to force reload of config
-    pkill gpg-agent 2>/dev/null || true
+    # Set up pinentry
+    export GPG_TTY=\$(tty)
+    export PINENTRY_USER_DATA='USE_CURSES=1'
     
     echo '=== Configuring rbw ==='
-    echo 'Enter your Bitwarden email:'
-    read -r RBW_EMAIL
-    rbw config set email \"\$RBW_EMAIL\"
-    
-    echo 'Are you using a self-hosted Bitwarden? (y/N)'
-    read -r SELF_HOSTED
-    if [[ \"\$SELF_HOSTED\" =~ ^[Yy]$ ]]; then
-        echo 'Enter base URL:'
-        read -r BASE_URL
-        rbw config set base_url \"\$BASE_URL\"
-    fi
-    
-    # Set pinentry to curses for rbw
+    rbw config set email '$RBW_EMAIL'
     rbw config set pinentry pinentry-curses
     
+    if [ -n '$BASE_URL' ]; then
+        rbw config set base_url '$BASE_URL'
+    fi
+    
     echo '=== Logging into rbw ==='
-    rbw login || exit 1
+    echo '$BITWARDEN_PASSWORD' | rbw login
     
     echo '=== Unlocking rbw ==='
-    rbw unlock || exit 1
+    echo '$BITWARDEN_PASSWORD' | rbw unlock
+    
+    echo '=== Syncing with server ==='
+    rbw sync
     
     echo '=== Extracting NixOS AGE Key ==='
     mkdir -p /root/.config/sops/age
-    rbw get 'NixOS AGE Key' > /root/.config/sops/age/keys.txt || exit 1
+    rbw get 'NixOS AGE Key' > /root/.config/sops/age/keys.txt
     chmod 600 /root/.config/sops/age/keys.txt
     
     # Verify the key was extracted
@@ -186,6 +194,9 @@ nix-shell -p rbw pinentry-curses gnupg --run "
     fi
     
     echo 'SOPS key extracted successfully!'
+    
+    # Lock rbw when done
+    rbw lock
 " || error "Failed to setup rbw and extract SOPS key. Cannot continue."
 
 # Verify SOPS key exists and is valid
@@ -278,11 +289,6 @@ info "Copying SOPS key to installed system..."
 mkdir -p /mnt/root/.config/sops/age
 cp /root/.config/sops/age/keys.txt /mnt/root/.config/sops/age/keys.txt
 chmod 600 /mnt/root/.config/sops/age/keys.txt
-
-# Also copy to user's home if they need it
-mkdir -p /mnt/home/"$REGULAR_USER"/.config/sops/age
-cp /root/.config/sops/age/keys.txt /mnt/home/"$REGULAR_USER"/.config/sops/age/keys.txt
-nixos-enter --root /mnt -c "chown -R $REGULAR_USER:users /home/$REGULAR_USER/.config" 2>/dev/null || true
 
 # Setup git for SSH (reminder)
 cat > /mnt/root/setup-git-ssh.sh << 'EOF'
