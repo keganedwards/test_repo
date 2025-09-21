@@ -60,14 +60,6 @@ echo
 
 [ "$ENCRYPTION_PASSWORD" = "$ENCRYPTION_PASSWORD_CONFIRM" ] || error "Encryption passwords do not match!"
 
-# Prompt for Bitwarden/rbw configuration
-prompt "Enter your Bitwarden email address:"
-read -r BITWARDEN_EMAIL
-
-prompt "Enter your Bitwarden server URL (or press Enter for default bitwarden.com):"
-read -r BITWARDEN_URL
-BITWARDEN_URL=${BITWARDEN_URL:-"https://vault.bitwarden.com"}
-
 # Detect and select disk
 info "Available disks:"
 lsblk -dno NAME,SIZE,TYPE | grep disk
@@ -144,55 +136,48 @@ git clone "$GITHUB_REPO" ~/nixos-config
 
 info "Found configuration for $HOSTNAME"
 
-# Setup rbw and extract SOPS key with proper error handling
+# Setup rbw and extract SOPS key
 info "Setting up rbw for SOPS key extraction..."
-export HOME=/root
-mkdir -p /root/.config/rbw
 
-# Configure rbw properly
+# Configure rbw first
 nix-shell -p rbw --run "
-    rbw config set email '$BITWARDEN_EMAIL'
-    rbw config set base_url '$BITWARDEN_URL'
+    echo '=== Configuring rbw ==='
+    echo 'Enter your Bitwarden email:'
+    read -r RBW_EMAIL
+    rbw config set email \$RBW_EMAIL
     
-    echo 'Please log into rbw...'
-    if ! rbw login; then
-        echo 'ERROR: Failed to login to rbw'
-        exit 1
+    echo 'Are you using a self-hosted Bitwarden? (y/N)'
+    read -r SELF_HOSTED
+    if [[ \"\$SELF_HOSTED\" =~ ^[Yy]$ ]]; then
+        echo 'Enter base URL:'
+        read -r BASE_URL
+        rbw config set base_url \$BASE_URL
     fi
     
-    echo 'Unlocking rbw...'
-    if ! rbw unlock; then
-        echo 'ERROR: Failed to unlock rbw'
-        exit 1
-    fi
+    echo '=== Logging into rbw ==='
+    rbw login || exit 1
     
-    echo 'Testing rbw access...'
-    if ! rbw list >/dev/null 2>&1; then
-        echo 'ERROR: rbw is not working properly'
-        exit 1
-    fi
+    echo '=== Unlocking rbw ==='
+    rbw unlock || exit 1
     
-    echo 'Extracting NixOS AGE Key...'
+    echo '=== Extracting NixOS AGE Key ==='
     mkdir -p /root/.config/sops/age
-    if ! rbw get 'NixOS AGE Key' > /root/.config/sops/age/keys.txt; then
-        echo 'ERROR: Failed to extract NixOS AGE Key'
-        exit 1
-    fi
+    rbw get 'NixOS AGE Key' > /root/.config/sops/age/keys.txt || exit 1
     chmod 600 /root/.config/sops/age/keys.txt
     
     # Verify the key was extracted
     if [ ! -s /root/.config/sops/age/keys.txt ]; then
-        echo 'ERROR: SOPS key file is empty'
+        echo 'ERROR: SOPS key file is empty!'
         exit 1
     fi
     
     echo 'SOPS key extracted successfully!'
-"
+" || error "Failed to setup rbw and extract SOPS key. Cannot continue."
 
-# Verify SOPS key was extracted
-[ -f /root/.config/sops/age/keys.txt ] && [ -s /root/.config/sops/age/keys.txt ] || error "SOPS key extraction failed!"
-
-info "SOPS key verified successfully!"
+# Verify SOPS key exists and is valid
+info "Verifying SOPS key..."
+[ -s /root/.config/sops/age/keys.txt ] || error "SOPS key file is missing or empty!"
+info "SOPS key verified!"
 
 # Update hardware-configuration.nix
 info "Updating hardware-configuration.nix..."
@@ -205,11 +190,6 @@ BOOT_NIX=$(find ~/nixos-config/hosts/"$HOSTNAME" -name "boot.nix" -type f | head
 [ -n "$BOOT_NIX" ] || error "boot.nix not found in ~/nixos-config/hosts/$HOSTNAME"
 
 info "Updating boot.nix at $BOOT_NIX..."
-
-# Get swap file size in MB for the config
-SWAP_MB=$((SWAP_GB * 1024))
-
-# Create a more compatible boot.nix
 cat > "$BOOT_NIX" << EOF
 # /hosts/$HOSTNAME/boot.nix
 let
@@ -220,7 +200,7 @@ in {
   swapDevices = [
     {
       device = "/swapfile";
-      size = $SWAP_MB;  # Size in MB
+      size = $((SWAP_GB * 1024));  # Size in MB
     }
   ];
 
@@ -237,80 +217,70 @@ EOF
 
 info "boot.nix updated successfully!"
 
-# Create a temporary configuration for the initial install that includes basic LUKS support
-info "Creating temporary configuration for initial install..."
-cat >> /mnt/etc/nixos/configuration.nix << EOF
+# Optional: Setup Clevis for TPM auto-decryption
+prompt "Do you want to enable TPM auto-decryption with Clevis? (y/N)"
+read -r ENABLE_CLEVIS
 
-# Temporary LUKS configuration for initial boot
-boot.initrd.luks.devices."cryptroot" = {
-  device = "/dev/disk/by-uuid/$ROOT_UUID";
-  allowDiscards = true;
-};
-
-# Enable flakes temporarily
-nix.settings.experimental-features = [ "nix-command" "flakes" ];
-EOF
-
-# Setup Clevis for TPM auto-decryption (but don't fail if TPM isn't available)
-info "Setting up Clevis for TPM-based auto-decryption..."
-if nix-shell -p clevis luksmeta cryptsetup --run "
-    if tpm2_getcap properties-fixed 2>/dev/null; then
-        echo 'TPM detected, setting up Clevis binding...'
-        echo -n '$ENCRYPTION_PASSWORD' | clevis luks bind -d '$ROOT_PART' tpm2 '{}' -y
-        echo 'Clevis TPM binding complete!'
+if [[ "$ENABLE_CLEVIS" =~ ^[Yy]$ ]]; then
+    info "Setting up Clevis for TPM-based auto-decryption..."
+    
+    # Check if TPM is available
+    if [ ! -e /dev/tpm0 ] && [ ! -e /dev/tpmrm0 ]; then
+        warn "No TPM device found. Skipping Clevis setup."
     else
-        echo 'WARNING: No TPM detected, skipping Clevis setup'
-        exit 0
+        nix-shell -p clevis luksmeta cryptsetup tpm2-tools --run "
+            echo -n '$ENCRYPTION_PASSWORD' | clevis luks bind -d '$ROOT_PART' tpm2 '{}' -y
+        " && info "Clevis TPM binding complete!" || warn "Clevis setup failed, continuing without auto-decryption"
     fi
-"; then
-    info "Clevis setup completed"
 else
-    warn "Clevis setup failed or TPM not available - system will require manual password entry"
+    info "Skipping Clevis setup. You'll need to enter encryption password on boot."
 fi
 
-# First install with basic configuration
-info "Installing NixOS with basic configuration..."
-nixos-install --root /mnt
+# Install NixOS
+info "Installing NixOS with flake configuration..."
+nixos-install --flake ~/nixos-config#"$HOSTNAME" --root /mnt --no-root-passwd || error "nixos-install failed!"
 
 # Set passwords
 info "Setting passwords..."
 echo "root:$USER_PASSWORD" | nixos-enter --root /mnt -c 'chpasswd'
 
-# Copy nixos-config and SOPS key to installed system
-info "Copying nixos-config and SOPS key to installed system..."
+# Determine your regular username (we need to prompt for it)
+prompt "Enter your regular username (not root):"
+read -r REGULAR_USER
+
+echo "$REGULAR_USER:$USER_PASSWORD" | nixos-enter --root /mnt -c 'chpasswd' 2>/dev/null || warn "Could not set password for $REGULAR_USER (user might not exist yet)"
+
+# Copy nixos-config to installed system
+info "Copying nixos-config to installed system..."
+mkdir -p /mnt/home/"$REGULAR_USER"
+cp -r ~/nixos-config /mnt/home/"$REGULAR_USER"/nixos-config
+nixos-enter --root /mnt -c "chown -R $REGULAR_USER:users /home/$REGULAR_USER/nixos-config" 2>/dev/null || true
+
+# Also copy to root
 cp -r ~/nixos-config /mnt/root/nixos-config
+
+# Copy SOPS key to installed system
+info "Copying SOPS key to installed system..."
 mkdir -p /mnt/root/.config/sops/age
 cp /root/.config/sops/age/keys.txt /mnt/root/.config/sops/age/keys.txt
 chmod 600 /mnt/root/.config/sops/age/keys.txt
 
-# Create a post-install script for switching to flake configuration
-cat > /mnt/root/switch-to-flake.sh << EOF
-#!/usr/bin/env bash
-set -euo pipefail
-
-echo "Switching to flake configuration..."
-cd /root/nixos-config
-
-# Enable flakes if not already enabled
-if ! grep -q "experimental-features.*flakes" /etc/nixos/configuration.nix; then
-    echo "Enabling flakes..."
-    nixos-rebuild switch --flake .#$HOSTNAME
-else
-    nixos-rebuild switch --flake .#$HOSTNAME
-fi
-
-echo "Flake configuration applied successfully!"
-EOF
-
-chmod +x /mnt/root/switch-to-flake.sh
-
 # Setup git for SSH (reminder)
-cat > /mnt/root/setup-git-ssh.sh << EOF
+cat > /mnt/root/setup-git-ssh.sh << 'EOF'
 #!/usr/bin/env bash
 # Run this after first boot to switch to SSH
 cd ~/nixos-config
-git remote set-url origin \$(git remote get-url origin | sed 's|https://github.com/|git@github.com:|')
+git remote set-url origin $(git remote get-url origin | sed 's|https://github.com/|git@github.com:|')
 echo "Git remote updated to use SSH"
+
+# Also update in user's home directory
+if [ -d /home/*/nixos-config ]; then
+    for dir in /home/*/nixos-config; do
+        cd "$dir"
+        git remote set-url origin $(git remote get-url origin | sed 's|https://github.com/|git@github.com:|')
+        echo "Git remote updated to use SSH in $dir"
+    done
+fi
 EOF
 chmod +x /mnt/root/setup-git-ssh.sh
 
@@ -324,13 +294,19 @@ info "  - Hostname: $HOSTNAME"
 info "  - Encrypted root: $ROOT_PART (UUID: $ROOT_UUID)"
 info "  - LUKS name: $LUKS_NAME"
 info "  - Swap file: ${SWAP_GB}GB"
-info "  - SOPS key: Extracted and copied"
+if [[ "$ENABLE_CLEVIS" =~ ^[Yy]$ ]]; then
+    info "  - TPM auto-decryption: Enabled"
+else
+    info "  - TPM auto-decryption: Disabled"
+fi
 info ""
-info "Next steps after reboot:"
-info "  1. Boot should work with password prompt"
-info "  2. Run: /root/switch-to-flake.sh"
-info "  3. Run: /root/setup-git-ssh.sh"
-info "  4. Reboot to test full flake configuration"
+info "Next steps:"
+info "  1. Reboot into your new system"
+if [[ ! "$ENABLE_CLEVIS" =~ ^[Yy]$ ]]; then
+    info "  2. Enter your encryption password when prompted"
+fi
+info "  2. Run: sudo /root/setup-git-ssh.sh"
+info "  3. Verify your system boots correctly"
 info ""
 
 prompt "Press Enter to reboot or Ctrl+C to cancel..."
