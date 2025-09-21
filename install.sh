@@ -139,20 +139,34 @@ info "Found configuration for $HOSTNAME"
 # Setup rbw and extract SOPS key
 info "Setting up rbw for SOPS key extraction..."
 
-# Configure rbw first
-nix-shell -p rbw --run "
+# Set up environment for rbw in the live USB
+export GPG_TTY=$(tty)
+export DISPLAY=:0  # In case we're in a graphical environment
+
+# Configure rbw with proper pinentry
+nix-shell -p rbw pinentry-curses gnupg --run "
+    # Configure GPG to use curses pinentry
+    mkdir -p ~/.gnupg
+    echo 'pinentry-program $(which pinentry-curses)' > ~/.gnupg/gpg-agent.conf
+    
+    # Kill any existing gpg-agent to force reload of config
+    pkill gpg-agent 2>/dev/null || true
+    
     echo '=== Configuring rbw ==='
     echo 'Enter your Bitwarden email:'
     read -r RBW_EMAIL
-    rbw config set email \$RBW_EMAIL
+    rbw config set email \"\$RBW_EMAIL\"
     
     echo 'Are you using a self-hosted Bitwarden? (y/N)'
     read -r SELF_HOSTED
     if [[ \"\$SELF_HOSTED\" =~ ^[Yy]$ ]]; then
         echo 'Enter base URL:'
         read -r BASE_URL
-        rbw config set base_url \$BASE_URL
+        rbw config set base_url \"\$BASE_URL\"
     fi
+    
+    # Set pinentry to curses for rbw
+    rbw config set pinentry pinentry-curses
     
     echo '=== Logging into rbw ==='
     rbw login || exit 1
@@ -264,6 +278,11 @@ info "Copying SOPS key to installed system..."
 mkdir -p /mnt/root/.config/sops/age
 cp /root/.config/sops/age/keys.txt /mnt/root/.config/sops/age/keys.txt
 chmod 600 /mnt/root/.config/sops/age/keys.txt
+
+# Also copy to user's home if they need it
+mkdir -p /mnt/home/"$REGULAR_USER"/.config/sops/age
+cp /root/.config/sops/age/keys.txt /mnt/home/"$REGULAR_USER"/.config/sops/age/keys.txt
+nixos-enter --root /mnt -c "chown -R $REGULAR_USER:users /home/$REGULAR_USER/.config" 2>/dev/null || true
 
 # Setup git for SSH (reminder)
 cat > /mnt/root/setup-git-ssh.sh << 'EOF'
