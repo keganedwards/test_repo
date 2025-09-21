@@ -29,13 +29,13 @@ prompt() {
 echo -e "${GREEN}"
 echo "=================================="
 echo "  NixOS Installation Script"
-echo "  systemd-boot + cryptenroll"
+echo "  systemd-boot + systemd-cryptenroll"
 echo "=================================="
 echo -e "${NC}"
 
 # Check if we're booted in EFI mode
 if [ ! -d /sys/firmware/efi ]; then
-    error "This script requires EFI boot mode. Please boot the USB in UEFI mode, not Legacy/BIOS."
+    error "This script requires EFI boot mode. Please boot the live USB in EFI mode, not Legacy/BIOS."
 fi
 
 info "✓ System is booted in EFI mode"
@@ -50,7 +50,7 @@ info "Will clone from: $GITHUB_REPO"
 prompt "Enter hostname for this machine:"
 read -r HOSTNAME
 
-# Prompt for user password with retry
+# Prompt for user password with retry logic
 while true; do
     prompt "Enter password for your user (will also be used for root):"
     read -sr USER_PASSWORD
@@ -66,7 +66,7 @@ while true; do
     fi
 done
 
-# Prompt for encryption password with retry
+# Prompt for encryption password with retry logic
 while true; do
     prompt "Enter disk encryption password:"
     read -sr ENCRYPTION_PASSWORD
@@ -97,11 +97,11 @@ prompt "Type 'YES' to continue:"
 read -r CONFIRM
 [ "$CONFIRM" = "YES" ] || error "Installation cancelled"
 
-# Partition disk
-info "Partitioning disk..."
+# Partition disk for EFI
+info "Partitioning disk for EFI boot..."
 wipefs -af "$DISK"
 sgdisk --zap-all "$DISK"
-sgdisk -n 1:0:+512M -t 1:ef00 -c 1:boot "$DISK"
+sgdisk -n 1:0:+1G -t 1:ef00 -c 1:boot "$DISK"  # Larger EFI partition
 sgdisk -n 2:0:0 -t 2:8300 -c 2:root "$DISK"
 
 # Determine partition naming
@@ -113,7 +113,7 @@ else
     ROOT_PART="${DISK}2"
 fi
 
-# Format boot partition
+# Format EFI system partition
 info "Formatting EFI system partition..."
 mkfs.fat -F 32 -n BOOT "$BOOT_PART"
 
@@ -151,7 +151,7 @@ nixos-generate-config --root /mnt
 
 # Clone nixos-config
 info "Cloning nixos-config from $GITHUB_REPO..."
-git clone "$GITHUB_REPO" ~/nixos-config || error "Failed to clone repository"
+git clone "$GITHUB_REPO" ~/nixos-config || error "Failed to clone repository."
 
 # Check hostname directory exists
 [ -d ~/nixos-config/hosts/"$HOSTNAME" ] || error "No configuration found for hostname '$HOSTNAME'"
@@ -162,12 +162,14 @@ info "Found configuration for $HOSTNAME"
 info "Setting up rbw for SOPS key extraction..."
 export GPG_TTY=$(tty)
 
+# Configure and use rbw with retry logic
 RBW_SUCCESS=false
 RBW_RETRIES=0
 MAX_RBW_RETRIES=3
 
 while [ "$RBW_SUCCESS" = false ] && [ $RBW_RETRIES -lt $MAX_RBW_RETRIES ]; do
     nix-shell -p rbw pinentry-curses gnupg --run '
+        # Configure GPG to use curses pinentry
         mkdir -p ~/.gnupg
         echo "pinentry-program $(which pinentry-curses)" > ~/.gnupg/gpg-agent.conf
         pkill gpg-agent 2>/dev/null || true
@@ -196,14 +198,18 @@ while [ "$RBW_SUCCESS" = false ] && [ $RBW_RETRIES -lt $MAX_RBW_RETRIES ]; do
         rbw get "NixOS AGE Key" > /root/.config/sops/age/keys.txt || exit 1
         chmod 600 /root/.config/sops/age/keys.txt
         
-        [ -s /root/.config/sops/age/keys.txt ] || exit 1
+        if [ ! -s /root/.config/sops/age/keys.txt ]; then
+            echo "ERROR: SOPS key file is empty!"
+            exit 1
+        fi
+        
         echo "SOPS key extracted successfully!"
     ' && RBW_SUCCESS=true || {
         RBW_RETRIES=$((RBW_RETRIES + 1))
         if [ $RBW_RETRIES -lt $MAX_RBW_RETRIES ]; then
-            warn "Failed. Attempt $RBW_RETRIES of $MAX_RBW_RETRIES. Try again."
+            warn "Failed to unlock rbw. Attempt $RBW_RETRIES of $MAX_RBW_RETRIES. Please try again."
         else
-            error "Failed to extract SOPS key after $MAX_RBW_RETRIES attempts"
+            error "Failed to setup rbw after $MAX_RBW_RETRIES attempts."
         fi
     }
 done
@@ -219,11 +225,11 @@ info "Updating hardware-configuration.nix..."
 cp /mnt/etc/nixos/hardware-configuration.nix ~/nixos-config/hosts/"$HOSTNAME"/hardware-configuration.nix
 
 # Find and update boot.nix
-info "Finding boot.nix..."
+info "Finding and updating boot.nix..."
 BOOT_NIX=$(find ~/nixos-config/hosts/"$HOSTNAME" -name "boot.nix" -type f | head -n 1)
-[ -n "$BOOT_NIX" ] || error "boot.nix not found"
+[ -n "$BOOT_NIX" ] || error "boot.nix not found in ~/nixos-config/hosts/$HOSTNAME"
 
-info "Updating boot.nix..."
+# Create simple boot configuration
 cat > "$BOOT_NIX" << EOF
 # /hosts/$HOSTNAME/boot.nix
 let
@@ -233,7 +239,7 @@ in {
   swapDevices = [
     {
       device = "/swapfile";
-      size = $((SWAP_GB * 1024));
+      size = $((SWAP_GB * 1024));  # Size in MB
     }
   ];
 
@@ -241,16 +247,17 @@ in {
     root = {
       luksName = ${HOSTNAME}RootLuksName;
       devicePath = ${HOSTNAME}RootLuksDevicePath;
+      allowDiscards = true;
     };
   };
 }
 EOF
 
-info "✓ boot.nix updated!"
+info "boot.nix updated successfully!"
 
 # Install NixOS
-info "Installing NixOS..."
-nixos-install --flake ~/nixos-config#"$HOSTNAME" --root /mnt --no-root-passwd || error "Installation failed!"
+info "Installing NixOS with flake configuration..."
+nixos-install --flake ~/nixos-config#"$HOSTNAME" --root /mnt --no-root-passwd || error "nixos-install failed!"
 
 # Set passwords
 info "Setting passwords..."
@@ -258,72 +265,76 @@ echo "root:$USER_PASSWORD" | nixos-enter --root /mnt -c 'chpasswd'
 
 prompt "Enter your regular username (not root):"
 read -r REGULAR_USER
-echo "$REGULAR_USER:$USER_PASSWORD" | nixos-enter --root /mnt -c 'chpasswd' 2>/dev/null || true
+echo "$REGULAR_USER:$USER_PASSWORD" | nixos-enter --root /mnt -c 'chpasswd' 2>/dev/null || warn "Could not set password for $REGULAR_USER"
 
-# Copy configs
-info "Copying configs to installed system..."
+# Copy configs to installed system
+info "Copying configurations to installed system..."
 mkdir -p /mnt/home/"$REGULAR_USER"
 cp -r ~/nixos-config /mnt/home/"$REGULAR_USER"/nixos-config
 cp -r ~/nixos-config /mnt/root/nixos-config
+
+# Set ownership
 nixos-enter --root /mnt -c "chown -R $REGULAR_USER:users /home/$REGULAR_USER/nixos-config" 2>/dev/null || true
 
+# Copy SOPS key to user home
 mkdir -p /mnt/home/"$REGULAR_USER"/.config/sops/age
 cp /root/.config/sops/age/keys.txt /mnt/home/"$REGULAR_USER"/.config/sops/age/keys.txt
 nixos-enter --root /mnt -c "chown -R $REGULAR_USER:users /home/$REGULAR_USER/.config" 2>/dev/null || true
 
-# Setup TPM auto-unlock with systemd-cryptenroll
-prompt "Setup TPM auto-unlock now? (y/N)"
-read -r SETUP_TPM
-
-if [[ "$SETUP_TPM" =~ ^[Yy]$ ]]; then
-    info "Setting up TPM auto-unlock with systemd-cryptenroll..."
-    
-    # Fix permissions and load modules
-    chmod 666 /dev/tpmrm0 2>/dev/null || chmod 666 /dev/tpm0 2>/dev/null || true
-    modprobe tpm_tis || true
-    modprobe tpm_crb || true
-    
-    nix-shell -p tpm2-tools tpm2-tss systemd --run "
-        echo 'Enrolling TPM2...'
-        echo -n '$ENCRYPTION_PASSWORD' | systemd-cryptenroll --tpm2-device=auto --tpm2-pcrs=0+7 '$ROOT_PART' || {
-            echo 'PCR binding failed, trying without PCRs...'
-            echo -n '$ENCRYPTION_PASSWORD' | systemd-cryptenroll --tpm2-device=auto '$ROOT_PART'
-        }
-    " && info "✓ TPM auto-unlock configured!" || warn "TPM enrollment failed (can set up after boot)"
-fi
-
-# Post-install scripts
-cat > /mnt/root/setup-tpm-unlock.sh << 'EOF'
+# Create setup scripts
+cat > /mnt/root/setup-tpm-unlock.sh << EOF
 #!/usr/bin/env bash
-# Setup TPM auto-unlock after first boot
+# Set up TPM auto-unlock after first successful boot
 
-set -e
+set -euo pipefail
 
-LUKS_DEVICE="$1"
+echo "Setting up TPM auto-unlock..."
 
-if [ -z "$LUKS_DEVICE" ]; then
-    echo "Usage: $0 /dev/sdXY"
-    echo "Example: $0 /dev/nvme0n1p2"
+# Load TPM modules
+sudo modprobe tpm_crb 2>/dev/null || true
+sudo modprobe tpm_tis 2>/dev/null || true
+
+# Check TPM is available
+if [ ! -e /dev/tpmrm0 ] && [ ! -e /dev/tpm0 ]; then
+    echo "❌ No TPM device found"
+    echo "Make sure TPM is enabled in BIOS"
     exit 1
 fi
 
-echo "Setting up TPM auto-unlock for $LUKS_DEVICE"
+echo "✓ TPM device found"
+
+# Get disk encryption password
 echo "Enter your disk encryption password:"
+read -sr DISK_PASSWORD
 
-# Try with PCRs first
-if sudo systemd-cryptenroll --tpm2-device=auto --tpm2-pcrs=0+7 "$LUKS_DEVICE"; then
-    echo "✓ TPM enrolled with PCRs 0+7"
-elif sudo systemd-cryptenroll --tpm2-device=auto "$LUKS_DEVICE"; then
-    echo "✓ TPM enrolled (no PCRs)"
+# Add TPM2 unlock to LUKS
+echo "Adding TPM2 unlock capability..."
+if echo -n "\$DISK_PASSWORD" | sudo systemd-cryptenroll --tpm2-device=auto --tpm2-pcrs=7 $ROOT_PART; then
+    echo "✓ TPM2 unlock enrolled successfully!"
+    echo "✓ Your disk will auto-unlock on next boot"
+    
+    # Rebuild to update initrd
+    echo "Updating system configuration..."
+    sudo nixos-rebuild switch
+    
+    echo ""
+    echo "🎉 Setup complete! Your disk will auto-unlock using TPM on next boot."
+    echo "   If it fails, you can still enter your password manually."
 else
-    echo "✗ Failed to enroll TPM"
-    exit 1
+    echo "❌ Failed to enroll TPM2 unlock"
+    echo "This might be because:"
+    echo "  - SecureBoot is disabled (PCR 7 changes)"
+    echo "  - TPM is owned by another OS"
+    echo ""
+    echo "Try without PCR binding:"
+    if echo -n "\$DISK_PASSWORD" | sudo systemd-cryptenroll --tpm2-device=auto $ROOT_PART; then
+        echo "✓ TPM2 enrolled without PCR binding (less secure but should work)"
+        sudo nixos-rebuild switch
+    else
+        echo "❌ TPM enrollment failed completely"
+        exit 1
+    fi
 fi
-
-echo "✓ Rebuilding initrd..."
-sudo nixos-rebuild boot
-
-echo "✓ Done! Reboot to test auto-unlock"
 EOF
 chmod +x /mnt/root/setup-tpm-unlock.sh
 
@@ -331,43 +342,59 @@ cat > /mnt/root/setup-git-ssh.sh << 'EOF'
 #!/usr/bin/env bash
 cd ~/nixos-config
 git remote set-url origin $(git remote get-url origin | sed 's|https://github.com/|git@github.com:|')
-echo "✓ Git remote updated to SSH"
+echo "Git remote updated to use SSH"
 
-for dir in /home/*/nixos-config; do
-    [ -d "$dir" ] && cd "$dir" && git remote set-url origin $(git remote get-url origin | sed 's|https://github.com/|git@github.com:|')
-done
+if [ -d /home/*/nixos-config ]; then
+    for dir in /home/*/nixos-config; do
+        cd "$dir"
+        git remote set-url origin $(git remote get-url origin | sed 's|https://github.com/|git@github.com:|')
+    done
+fi
 EOF
 chmod +x /mnt/root/setup-git-ssh.sh
 
-cat > /mnt/root/install-info.txt << EOF
-NixOS Installation Complete
-===========================
+# Create install summary
+cat > /mnt/root/install-summary.txt << EOF
+NixOS Installation Summary
+==========================
 Date: $(date)
 Hostname: $HOSTNAME
-Boot: systemd-boot (UEFI)
+Boot: systemd-boot (EFI)
+Disk: $DISK
 Root: $ROOT_PART (UUID: $ROOT_UUID)
 LUKS: $LUKS_NAME
 Swap: ${SWAP_GB}GB
 
-Post-install:
-- If TPM unlock didn't work: sudo /root/setup-tpm-unlock.sh $ROOT_PART
-- Setup SSH for git: sudo /root/setup-git-ssh.sh
+Next steps after first boot:
+1. Run: sudo /root/setup-tpm-unlock.sh
+2. Run: sudo /root/setup-git-ssh.sh
+3. Test reboot to verify TPM auto-unlock
+
+Files:
+- SOPS key: /root/.config/sops/age/keys.txt
+- Config: /root/nixos-config
 EOF
 
 info ""
-info "======================================"
-info "  ✓ Installation Complete!"
-info "======================================"
+info "🎉 Installation Complete!"
+info ""
+info "Summary:"
+info "  - Hostname: $HOSTNAME"
+info "  - Boot: systemd-boot"
+info "  - Root: $ROOT_PART"
+info "  - Swap: ${SWAP_GB}GB"
 info ""
 info "Next steps:"
-info "  1. Reboot"
-info "  2. Enter encryption password (unless TPM worked)"
-info "  3. Run: sudo /root/setup-git-ssh.sh"
-if [[ ! "$SETUP_TPM" =~ ^[Yy]$ ]]; then
-    info "  4. Run: sudo /root/setup-tpm-unlock.sh $ROOT_PART"
-fi
+info "  1. Reboot into your new system"
+info "  2. Enter disk encryption password when prompted"
+info "  3. Run: sudo /root/setup-tpm-unlock.sh"
+info "  4. Run: sudo /root/setup-git-ssh.sh"
+info ""
+info "The TPM auto-unlock will be configured after first boot!"
 info ""
 
 prompt "Reboot now? (y/N)"
 read -r REBOOT
-[[ "$REBOOT" =~ ^[Yy]$ ]] && reboot || exit 0
+if [[ "$REBOOT" =~ ^[Yy]$ ]]; then
+    reboot
+fi
