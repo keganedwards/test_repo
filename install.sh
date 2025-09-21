@@ -25,30 +25,6 @@ prompt() {
     echo -e "${BLUE}$1${NC}"
 }
 
-# Function to retry password input
-retry_password_input() {
-    local prompt_text="$1"
-    local confirm_text="$2"
-    local password1 password2
-    
-    while true; do
-        prompt "$prompt_text"
-        read -sr password1
-        echo
-        prompt "$confirm_text"
-        read -sr password2
-        echo
-        
-        if [ "$password1" = "$password2" ]; then
-            echo "$password1"
-            return 0
-        else
-            warn "Passwords do not match! Please try again."
-            echo
-        fi
-    done
-}
-
 # Banner
 echo -e "${GREEN}"
 echo "=================================="
@@ -56,21 +32,47 @@ echo "  NixOS Installation Script"
 echo "=================================="
 echo -e "${NC}"
 
-# Prompt for GitHub username (simplified)
+# Prompt for GitHub username (construct full URL)
 prompt "Enter your GitHub username:"
 read -r GITHUB_USERNAME
 GITHUB_REPO="https://github.com/${GITHUB_USERNAME}/nixos-config"
-info "Using repository: $GITHUB_REPO"
+info "Will clone from: $GITHUB_REPO"
 
 # Prompt for hostname
 prompt "Enter hostname for this machine:"
 read -r HOSTNAME
 
-# Get user password with retry
-USER_PASSWORD=$(retry_password_input "Enter password for your user (will also be used for root):" "Confirm password:")
+# Prompt for user password with retry logic
+while true; do
+    prompt "Enter password for your user (will also be used for root):"
+    read -sr USER_PASSWORD
+    echo
+    prompt "Confirm password:"
+    read -sr USER_PASSWORD_CONFIRM
+    echo
+    
+    if [ "$USER_PASSWORD" = "$USER_PASSWORD_CONFIRM" ]; then
+        break
+    else
+        warn "Passwords do not match! Please try again."
+    fi
+done
 
-# Get encryption password with retry
-ENCRYPTION_PASSWORD=$(retry_password_input "Enter disk encryption password:" "Confirm encryption password:")
+# Prompt for encryption password with retry logic
+while true; do
+    prompt "Enter disk encryption password:"
+    read -sr ENCRYPTION_PASSWORD
+    echo
+    prompt "Confirm encryption password:"
+    read -sr ENCRYPTION_PASSWORD_CONFIRM
+    echo
+    
+    if [ "$ENCRYPTION_PASSWORD" = "$ENCRYPTION_PASSWORD_CONFIRM" ]; then
+        break
+    else
+        warn "Encryption passwords do not match! Please try again."
+    fi
+done
 
 # Detect and select disk
 info "Available disks:"
@@ -141,103 +143,94 @@ nixos-generate-config --root /mnt
 
 # Clone nixos-config
 info "Cloning nixos-config from $GITHUB_REPO..."
-git clone "$GITHUB_REPO" ~/nixos-config
+git clone "$GITHUB_REPO" ~/nixos-config || error "Failed to clone repository. Check your username and network connection."
 
 # Check hostname directory exists
 [ -d ~/nixos-config/hosts/"$HOSTNAME" ] || error "No configuration found for hostname '$HOSTNAME' in ~/nixos-config/hosts/"
 
 info "Found configuration for $HOSTNAME"
 
-# Setup rbw and extract SOPS key with retry logic
+# Setup rbw and extract SOPS key
 info "Setting up rbw for SOPS key extraction..."
 
 # Set up environment for rbw in the live USB
 export GPG_TTY=$(tty)
 export DISPLAY=:0
 
-# Create the target directory for age key (in the mounted system)
-mkdir -p /mnt/root/.config/sops/age
+# Configure and use rbw with retry logic
+RBW_SUCCESS=false
+RBW_RETRIES=0
+MAX_RBW_RETRIES=3
 
-# Configure rbw with retry logic
-while true; do
-    nix-shell -p rbw pinentry-curses gnupg --run "
+while [ "$RBW_SUCCESS" = false ] && [ $RBW_RETRIES -lt $MAX_RBW_RETRIES ]; do
+    nix-shell -p rbw pinentry-curses gnupg --run '
         # Configure GPG to use curses pinentry
         mkdir -p ~/.gnupg
-        echo 'pinentry-program \$(which pinentry-curses)' > ~/.gnupg/gpg-agent.conf
+        echo "pinentry-program $(which pinentry-curses)" > ~/.gnupg/gpg-agent.conf
         
         # Kill any existing gpg-agent to force reload of config
         pkill gpg-agent 2>/dev/null || true
         
-        echo '=== Configuring rbw ==='
-        echo 'Enter your Bitwarden email:'
-        read -r RBW_EMAIL
-        rbw config set email \"\$RBW_EMAIL\"
-        
-        echo 'Are you using a self-hosted Bitwarden? (y/N)'
-        read -r SELF_HOSTED
-        if [[ \"\$SELF_HOSTED\" =~ ^[Yy]$ ]]; then
-            echo 'Enter base URL:'
-            read -r BASE_URL
-            rbw config set base_url \"\$BASE_URL\"
+        if [ ! -f ~/.config/rbw/config.json ]; then
+            echo "=== Configuring rbw ==="
+            echo "Enter your Bitwarden email:"
+            read -r RBW_EMAIL
+            rbw config set email "$RBW_EMAIL"
+            
+            echo "Are you using a self-hosted Bitwarden? (y/N)"
+            read -r SELF_HOSTED
+            if [[ "$SELF_HOSTED" =~ ^[Yy]$ ]]; then
+                echo "Enter base URL:"
+                read -r BASE_URL
+                rbw config set base_url "$BASE_URL"
+            fi
+            
+            # Set pinentry to curses for rbw
+            rbw config set pinentry pinentry-curses
+            
+            echo "=== Logging into rbw ==="
+            rbw login || exit 1
         fi
         
-        # Set pinentry to curses for rbw
-        rbw config set pinentry pinentry-curses
+        echo "=== Unlocking rbw ==="
+        rbw unlock || exit 1
         
-        echo '=== Logging into rbw ==='
-        if ! rbw login; then
-            echo 'Login failed!'
-            exit 1
-        fi
-        
-        echo '=== Unlocking rbw ==='
-        if ! rbw unlock; then
-            echo 'Unlock failed!'
-            exit 1
-        fi
-        
-        echo '=== Extracting NixOS AGE Key ==='
-        # Extract to both locations to ensure it's found
+        echo "=== Extracting NixOS AGE Key ==="
         mkdir -p /root/.config/sops/age
-        mkdir -p /mnt/root/.config/sops/age
-        
-        if ! rbw get 'NixOS AGE Key' > /tmp/age_key.txt; then
-            echo 'Failed to extract SOPS key!'
-            exit 1
-        fi
-        
-        # Copy to both locations
-        cp /tmp/age_key.txt /root/.config/sops/age/keys.txt
-        cp /tmp/age_key.txt /mnt/root/.config/sops/age/keys.txt
+        rbw get "NixOS AGE Key" > /root/.config/sops/age/keys.txt || exit 1
         chmod 600 /root/.config/sops/age/keys.txt
-        chmod 600 /mnt/root/.config/sops/age/keys.txt
-        rm /tmp/age_key.txt
         
         # Verify the key was extracted
-        if [ ! -s /root/.config/sops/age/keys.txt ] || [ ! -s /mnt/root/.config/sops/age/keys.txt ]; then
-            echo 'ERROR: SOPS key file is empty!'
+        if [ ! -s /root/.config/sops/age/keys.txt ]; then
+            echo "ERROR: SOPS key file is empty!"
             exit 1
         fi
         
-        echo 'SOPS key extracted successfully!'
-    " && break || {
-        warn "rbw setup failed. This could be due to:"
-        warn "  - Incorrect email or password"
-        warn "  - Network connectivity issues"
-        warn "  - Secret name mismatch (should be exactly 'NixOS AGE Key')"
-        echo
-        prompt "Try again? (y/N)"
-        read -r RETRY
-        if [[ ! "$RETRY" =~ ^[Yy]$ ]]; then
-            error "Cannot continue without SOPS key"
+        echo "SOPS key extracted successfully!"
+    ' && RBW_SUCCESS=true || {
+        RBW_RETRIES=$((RBW_RETRIES + 1))
+        if [ $RBW_RETRIES -lt $MAX_RBW_RETRIES ]; then
+            warn "Failed to unlock rbw or extract key. Attempt $RBW_RETRIES of $MAX_RBW_RETRIES. Please try again."
+        else
+            error "Failed to setup rbw and extract SOPS key after $MAX_RBW_RETRIES attempts. Cannot continue."
         fi
     }
 done
 
 # Verify SOPS key exists and is valid
 info "Verifying SOPS key..."
-[ -s /mnt/root/.config/sops/age/keys.txt ] || error "SOPS key file is missing or empty in mounted system!"
-info "SOPS key verified!"
+[ -s /root/.config/sops/age/keys.txt ] || error "SOPS key file is missing or empty!"
+info "SOPS key verified at /root/.config/sops/age/keys.txt"
+
+# Copy SOPS key to the mounted system BEFORE nixos-install
+info "Copying SOPS key to installed system at /mnt/root/.config/sops/age/keys.txt..."
+mkdir -p /mnt/root/.config/sops/age
+cp /root/.config/sops/age/keys.txt /mnt/root/.config/sops/age/keys.txt
+chmod 600 /mnt/root/.config/sops/age/keys.txt
+
+# Verify it was copied
+[ -s /mnt/root/.config/sops/age/keys.txt ] || error "Failed to copy SOPS key to installed system!"
+info "SOPS key successfully copied to installed system"
 
 # Update hardware-configuration.nix
 info "Updating hardware-configuration.nix..."
@@ -277,64 +270,95 @@ EOF
 
 info "boot.nix updated successfully!"
 
-# Setup Clevis for TPM auto-decryption with better error handling
+# Setup Clevis for TPM auto-decryption
 prompt "Do you want to enable TPM auto-decryption with Clevis? (y/N)"
 read -r ENABLE_CLEVIS
 
+CLEVIS_BOUND=false
+
 if [[ "$ENABLE_CLEVIS" =~ ^[Yy]$ ]]; then
-    info "Setting up Clevis for TPM-based auto-decryption..."
+    info "Checking TPM availability..."
     
-    # Check if TPM is available and accessible
     if [ ! -e /dev/tpm0 ] && [ ! -e /dev/tpmrm0 ]; then
         warn "No TPM device found at /dev/tpm0 or /dev/tpmrm0"
+        warn "Available devices:"
+        ls -la /dev/tpm* 2>/dev/null || echo "No TPM devices found"
         warn "Skipping Clevis setup."
-        ENABLE_CLEVIS="n"
     else
-        info "TPM device found, proceeding with Clevis setup..."
+        info "TPM device found. Setting up Clevis..."
         
-        # Try to set up Clevis with detailed error reporting
-        if nix-shell -p clevis luksmeta cryptsetup tpm2-tools tpm2-abrmd --run "
-            set -x  # Enable debug output
-            
-            # Check TPM status
-            echo 'Checking TPM status...'
-            tpm2_getcap properties-fixed 2>&1 || {
-                echo 'TPM2 tools cannot access TPM!'
-                exit 1
-            }
-            
-            # Try to bind with clevis
-            echo 'Attempting Clevis binding...'
-            echo -n '$ENCRYPTION_PASSWORD' | clevis luks bind -d '$ROOT_PART' tpm2 '{}' -y
-        "; then
-            info "Clevis TPM binding completed successfully!"
-        else
-            warn "Clevis setup failed. Detailed error information:"
-            warn "  - Check that TPM is enabled in BIOS/UEFI"
-            warn "  - Verify TPM is not in restricted mode"
-            warn "  - Ensure no BitLocker or other TPM usage conflicts"
-            warn "  - TPM may need to be cleared/reset"
-            warn ""
-            warn "You can manually set up Clevis after installation with:"
-            warn "  echo -n 'password' | sudo clevis luks bind -d $ROOT_PART tpm2 '{}'"
-            
-            prompt "Continue without auto-decryption? (y/N)"
-            read -r CONTINUE
-            if [[ ! "$CONTINUE" =~ ^[Yy]$ ]]; then
-                error "Installation cancelled due to Clevis failure"
+        # Try different TPM2 configurations
+        info "Attempting Clevis bind with PCR 7 (Secure Boot)..."
+        
+        CLEVIS_OUTPUT=$(mktemp)
+        
+        nix-shell -p clevis luksmeta cryptsetup tpm2-tools tpm2-tss --run "
+            # Try with PCR 7 first (Secure Boot)
+            echo 'Attempting: clevis luks bind with PCR 7'
+            if echo -n '$ENCRYPTION_PASSWORD' | clevis luks bind -d '$ROOT_PART' tpm2 '{\"pcr_ids\":\"7\"}' -y 2>&1 | tee $CLEVIS_OUTPUT; then
+                echo 'SUCCESS: Bound to TPM2 with PCR 7'
+                exit 0
             fi
-            ENABLE_CLEVIS="n"
-        fi
+            
+            echo 'PCR 7 failed, trying without PCR binding (less secure but more compatible)...'
+            if echo -n '$ENCRYPTION_PASSWORD' | clevis luks bind -d '$ROOT_PART' tpm2 '{}' -y 2>&1 | tee $CLEVIS_OUTPUT; then
+                echo 'SUCCESS: Bound to TPM2 without PCR'
+                exit 0
+            fi
+            
+            echo 'All Clevis binding attempts failed'
+            exit 1
+        " && {
+            CLEVIS_BOUND=true
+            info "Clevis TPM binding complete!"
+        } || {
+            warn "Clevis setup failed. Error output:"
+            cat "$CLEVIS_OUTPUT"
+            warn "Continuing without auto-decryption..."
+        }
+        
+        rm -f "$CLEVIS_OUTPUT"
     fi
+fi
+
+# Create clevis token file if binding succeeded, otherwise prepare manual unlock instructions
+if [ "$CLEVIS_BOUND" = true ]; then
+    info "Clevis binding successful - auto-decryption should work on boot"
+    
+    # Create the expected clevis secret directory structure that your config expects
+    mkdir -p /mnt/etc/clevis-secrets
+    
+    # Extract the clevis token from LUKS header
+    nix-shell -p clevis cryptsetup --run "
+        cryptsetup luksDump '$ROOT_PART' | grep -A 20 clevis > /mnt/etc/clevis-info.txt || true
+    "
 else
-    info "Skipping Clevis setup. You'll need to enter encryption password on boot."
+    warn "Clevis was not set up. You will need to enter the encryption password on each boot."
+    warn "To set up Clevis after first boot, run:"
+    warn "  sudo clevis luks bind -d $ROOT_PART tpm2 '{\"pcr_ids\":\"7\"}'"
+    
+    # Create a marker file so the config knows to skip clevis
+    mkdir -p /mnt/etc
+    touch /mnt/etc/skip-clevis-on-first-boot
 fi
 
 # Install NixOS
 info "Installing NixOS with flake configuration..."
-if ! nixos-install --flake ~/nixos-config#"$HOSTNAME" --root /mnt --no-root-passwd; then
-    error "nixos-install failed! Check the error messages above."
+info "This may take a while..."
+
+# Set environment variable to skip clevis if it wasn't set up
+if [ "$CLEVIS_BOUND" != true ]; then
+    export NIXOS_INSTALL_SKIP_CLEVIS=1
 fi
+
+nixos-install --flake ~/nixos-config#"$HOSTNAME" --root /mnt --no-root-passwd 2>&1 || {
+    error "nixos-install failed! Check the error messages above. Common issues:
+    - SOPS decryption failed (check age key at /mnt/root/.config/sops/age/keys.txt)
+    - Flake evaluation error (syntax error in configs)
+    - Missing clevis secrets (expected at /etc/clevis-secrets/secret.jwe)
+    
+If the error is about clevis secrets, you may need to modify your config to make clevis optional during install."
+}
 
 # Set passwords
 info "Setting passwords..."
@@ -357,8 +381,38 @@ cp -r ~/nixos-config /mnt/root/nixos-config
 
 # Copy SOPS key to user's home if they need it
 mkdir -p /mnt/home/"$REGULAR_USER"/.config/sops/age
-cp /mnt/root/.config/sops/age/keys.txt /mnt/home/"$REGULAR_USER"/.config/sops/age/keys.txt
+cp /root/.config/sops/age/keys.txt /mnt/home/"$REGULAR_USER"/.config/sops/age/keys.txt
 nixos-enter --root /mnt -c "chown -R $REGULAR_USER:users /home/$REGULAR_USER/.config" 2>/dev/null || true
+
+# Create post-install script for clevis if it wasn't set up
+if [ "$CLEVIS_BOUND" != true ]; then
+    cat > /mnt/root/setup-clevis.sh << EOF
+#!/usr/bin/env bash
+# Run this after first boot to set up Clevis TPM auto-decryption
+
+echo "Setting up Clevis for TPM auto-decryption..."
+echo "You will be prompted for your disk encryption password"
+
+# Try with PCR 7 (Secure Boot)
+sudo clevis luks bind -d $ROOT_PART tpm2 '{"pcr_ids":"7"}' && {
+    echo "Success! Clevis bound to TPM with PCR 7"
+    echo "Auto-decryption should work on next boot"
+    exit 0
+}
+
+# Fallback: try without PCR
+echo "PCR 7 failed, trying without PCR binding..."
+sudo clevis luks bind -d $ROOT_PART tpm2 '{}' && {
+    echo "Success! Clevis bound to TPM (no PCR)"
+    echo "Auto-decryption should work on next boot"
+    exit 0
+}
+
+echo "Failed to bind Clevis. Check that TPM is enabled in BIOS"
+exit 1
+EOF
+    chmod +x /mnt/root/setup-clevis.sh
+fi
 
 # Setup git for SSH (reminder)
 cat > /mnt/root/setup-git-ssh.sh << 'EOF'
@@ -379,6 +433,36 @@ fi
 EOF
 chmod +x /mnt/root/setup-git-ssh.sh
 
+# Create debug info file
+cat > /mnt/root/install-info.txt << EOF
+NixOS Installation Information
+==============================
+Date: $(date)
+Hostname: $HOSTNAME
+Disk: $DISK
+Root Partition: $ROOT_PART
+Root UUID: $ROOT_UUID
+LUKS Name: $LUKS_NAME
+Swap Size: ${SWAP_GB}GB
+Clevis Bound: ${CLEVIS_BOUND}
+
+SOPS Key Location: /root/.config/sops/age/keys.txt
+Config Location: /root/nixos-config
+
+$(if [ "$CLEVIS_BOUND" != true ]; then
+    echo "Clevis was NOT set up during install."
+    echo "To enable auto-decryption, run: sudo /root/setup-clevis.sh"
+else
+    echo "Clevis auto-decryption is configured."
+fi)
+
+If boot fails, check:
+1. SOPS key is present and correct
+2. LUKS can be decrypted manually: cryptsetup open /dev/disk/by-uuid/$ROOT_UUID cryptroot
+3. Boot loader was installed correctly
+4. Check /etc/clevis-secrets/ for clevis configuration
+EOF
+
 info ""
 info "======================================"
 info "  Installation Complete!"
@@ -386,25 +470,28 @@ info "======================================"
 info ""
 info "Summary:"
 info "  - Hostname: $HOSTNAME"
-info "  - Repository: $GITHUB_REPO"
 info "  - Encrypted root: $ROOT_PART (UUID: $ROOT_UUID)"
 info "  - LUKS name: $LUKS_NAME"
 info "  - Swap file: ${SWAP_GB}GB"
-if [[ "$ENABLE_CLEVIS" =~ ^[Yy]$ ]]; then
-    info "  - TPM auto-decryption: Enabled"
+if [ "$CLEVIS_BOUND" = true ]; then
+    info "  - TPM auto-decryption: ENABLED ✓"
 else
-    info "  - TPM auto-decryption: Disabled"
+    info "  - TPM auto-decryption: NOT SET UP"
+    info "    Run 'sudo /root/setup-clevis.sh' after first boot to enable"
 fi
+info "  - SOPS key: /root/.config/sops/age/keys.txt"
+info ""
+info "Installation details saved to /root/install-info.txt"
 info ""
 info "Next steps:"
 info "  1. Reboot into your new system"
-if [[ ! "$ENABLE_CLEVIS" =~ ^[Yy]$ ]]; then
+if [ "$CLEVIS_BOUND" != true ]; then
     info "  2. Enter your encryption password when prompted"
+    info "  3. Run: sudo /root/setup-clevis.sh (optional, for auto-decryption)"
 fi
-info "  2. Run: sudo /root/setup-git-ssh.sh"
-info "  3. Verify your system boots correctly"
+info "  4. Run: sudo /root/setup-git-ssh.sh"
 info ""
 
-prompt "Press Enter to reboot or Ctrl+C to cancel..."
+prompt "Press Enter to reboot or Ctrl+C to stay in live environment..."
 read -r
 reboot
