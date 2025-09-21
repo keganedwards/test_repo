@@ -32,6 +32,23 @@ echo "  NixOS Installation Script"
 echo "=================================="
 echo -e "${NC}"
 
+# Check boot mode (UEFI or BIOS)
+info "Detecting boot mode..."
+if [ -d /sys/firmware/efi/efivars ]; then
+    BOOT_MODE="uefi"
+    info "✓ System is booted in UEFI mode"
+    
+    # Ensure efivarfs is mounted
+    if ! mount | grep -q efivarfs; then
+        info "Mounting efivarfs..."
+        mount -t efivarfs efivarfs /sys/firmware/efi/efivars || warn "Could not mount efivarfs"
+    fi
+else
+    BOOT_MODE="bios"
+    warn "⚠ System is booted in BIOS/Legacy mode"
+    warn "  GRUB will be installed in BIOS mode"
+fi
+
 # Prompt for GitHub username (construct full URL)
 prompt "Enter your GitHub username:"
 read -r GITHUB_USERNAME
@@ -89,25 +106,42 @@ prompt "Type 'YES' to continue:"
 read -r CONFIRM
 [ "$CONFIRM" = "YES" ] || error "Installation cancelled"
 
-# Partition and encrypt disk
-info "Partitioning disk..."
+# Partition disk based on boot mode
+info "Partitioning disk for $BOOT_MODE mode..."
 wipefs -af "$DISK"
 sgdisk --zap-all "$DISK"
-sgdisk -n 1:0:+512M -t 1:ef00 -c 1:boot "$DISK"
-sgdisk -n 2:0:0 -t 2:8300 -c 2:root "$DISK"
+
+if [ "$BOOT_MODE" = "uefi" ]; then
+    # UEFI: EFI System Partition + root
+    sgdisk -n 1:0:+512M -t 1:ef00 -c 1:boot "$DISK"
+    sgdisk -n 2:0:0 -t 2:8300 -c 2:root "$DISK"
+else
+    # BIOS: BIOS boot partition + root
+    sgdisk -n 1:0:+1M -t 1:ef02 -c 1:bios "$DISK"
+    sgdisk -n 2:0:0 -t 2:8300 -c 2:root "$DISK"
+fi
 
 # Determine partition naming
 if [[ "$DISK" == *"nvme"* ]] || [[ "$DISK" == *"mmcblk"* ]]; then
-    BOOT_PART="${DISK}p1"
-    ROOT_PART="${DISK}p2"
+    PART1="${DISK}p1"
+    PART2="${DISK}p2"
 else
-    BOOT_PART="${DISK}1"
-    ROOT_PART="${DISK}2"
+    PART1="${DISK}1"
+    PART2="${DISK}2"
 fi
 
-# Format boot partition
-info "Formatting boot partition..."
-mkfs.fat -F 32 -n BOOT "$BOOT_PART"
+if [ "$BOOT_MODE" = "uefi" ]; then
+    BOOT_PART="$PART1"
+    ROOT_PART="$PART2"
+    
+    # Format boot partition as FAT32 for UEFI
+    info "Formatting EFI System Partition..."
+    mkfs.fat -F 32 -n BOOT "$BOOT_PART"
+else
+    # BIOS mode - PART1 is BIOS boot partition (no filesystem)
+    ROOT_PART="$PART2"
+    info "BIOS boot partition created (no filesystem needed)"
+fi
 
 # Encrypt root partition
 info "Encrypting root partition..."
@@ -125,8 +159,11 @@ LUKS_NAME="luks-${ROOT_UUID}"
 # Mount filesystems
 info "Mounting filesystems..."
 mount /dev/mapper/cryptroot /mnt
-mkdir -p /mnt/boot
-mount "$BOOT_PART" /mnt/boot
+
+if [ "$BOOT_MODE" = "uefi" ]; then
+    mkdir -p /mnt/boot
+    mount "$BOOT_PART" /mnt/boot
+fi
 
 # Create swap file
 info "Creating swap file for hibernation..."
@@ -242,8 +279,11 @@ BOOT_NIX=$(find ~/nixos-config/hosts/"$HOSTNAME" -name "boot.nix" -type f | head
 
 [ -n "$BOOT_NIX" ] || error "boot.nix not found in ~/nixos-config/hosts/$HOSTNAME"
 
-info "Updating boot.nix at $BOOT_NIX..."
-cat > "$BOOT_NIX" << EOF
+info "Updating boot.nix at $BOOT_NIX for $BOOT_MODE mode..."
+
+# Create boot.nix based on boot mode
+if [ "$BOOT_MODE" = "uefi" ]; then
+    cat > "$BOOT_NIX" << EOF
 # /hosts/$HOSTNAME/boot.nix
 let
   # The NEW, CORRECT values from your fresh install
@@ -267,8 +307,46 @@ in {
   };
 }
 EOF
+else
+    # BIOS mode - override the module's UEFI settings
+    cat > "$BOOT_NIX" << EOF
+# /hosts/$HOSTNAME/boot.nix
+let
+  # The NEW, CORRECT values from your fresh install
+  ${HOSTNAME}RootLuksName = "$LUKS_NAME";
+  ${HOSTNAME}RootLuksDevicePath = "/dev/disk/by-uuid/$ROOT_UUID";
+in {
+  swapDevices = [
+    {
+      device = "/swapfile";
+      size = $((SWAP_GB * 1024));  # Size in MB
+    }
+  ];
 
-info "boot.nix updated successfully!"
+  # Override boot loader settings for BIOS mode
+  boot.loader = {
+    systemd-boot.enable = false;
+    grub = {
+      enable = true;
+      efiSupport = false;  # BIOS mode
+      device = "$DISK";     # Install GRUB to disk
+    };
+    efi.canTouchEfiVariables = false;  # Not available in BIOS mode
+  };
+
+  # This block is all you need. Your custom module will read this
+  # and generate the correct boot.initrd.luks.devices and boot.initrd.clevis.devices.
+  custom.boot.luksPartitions = {
+    root = {
+      luksName = ${HOSTNAME}RootLuksName;
+      devicePath = ${HOSTNAME}RootLuksDevicePath;
+    };
+  };
+}
+EOF
+fi
+
+info "boot.nix updated successfully for $BOOT_MODE mode!"
 
 # Setup Clevis for TPM auto-decryption
 prompt "Do you want to enable TPM auto-decryption with Clevis? (y/N)"
@@ -289,8 +367,8 @@ if [[ "$ENABLE_CLEVIS" =~ ^[Yy]$ ]]; then
     fi
     
     # Load TPM kernel modules
-    modprobe tpm_tis || true
-    modprobe tpm_crb || true
+    modprobe tpm_tis 2>/dev/null || true
+    modprobe tpm_crb 2>/dev/null || true
     
     if [ ! -e /dev/tpmrm0 ] && [ ! -e /dev/tpm0 ]; then
         warn "No TPM device found after loading modules"
@@ -305,10 +383,6 @@ if [[ "$ENABLE_CLEVIS" =~ ^[Yy]$ ]]; then
         nix-shell -p clevis luksmeta cryptsetup tpm2-tools tpm2-tss --run "
             export HOME=$CLEVIS_TMPDIR
             
-            # Show TPM device status
-            echo 'TPM devices:'
-            ls -la /dev/tpm* || true
-            
             # Test TPM access
             echo 'Testing TPM access...'
             if tpm2_getcap properties-fixed 2>&1 | grep -q 'TPM2_PT_FAMILY_INDICATOR'; then
@@ -317,20 +391,14 @@ if [[ "$ENABLE_CLEVIS" =~ ^[Yy]$ ]]; then
                 echo 'Warning: TPM may not be fully accessible'
             fi
             
-            # Attempt binding with different configurations
-            echo 'Attempting Clevis bind with PCR 7...'
-            if echo -n '$ENCRYPTION_PASSWORD' | clevis luks bind -d '$ROOT_PART' tpm2 '{\"pcr_ids\":\"7\"}' -y 2>&1; then
-                echo 'SUCCESS: Bound with PCR 7'
-                exit 0
-            fi
-            
-            echo 'PCR 7 failed, trying without PCR...'
+            # Attempt binding
+            echo 'Attempting Clevis bind without PCR...'
             if echo -n '$ENCRYPTION_PASSWORD' | clevis luks bind -d '$ROOT_PART' tpm2 '{}' -y 2>&1; then
-                echo 'SUCCESS: Bound without PCR'
+                echo 'SUCCESS: Bound to TPM'
                 exit 0
             fi
             
-            echo 'All binding attempts failed'
+            echo 'Binding failed'
             exit 1
         " && {
             CLEVIS_BOUND=true
@@ -341,28 +409,21 @@ if [[ "$ENABLE_CLEVIS" =~ ^[Yy]$ ]]; then
             mkdir -p /mnt/etc/clevis-secrets
             
             nix-shell -p clevis cryptsetup jose --run "
-                # Get the clevis token from LUKS
                 for slot in {0..7}; do
                     if cryptsetup luksDump '$ROOT_PART' | grep -A 5 \"Key Slot \$slot\" | grep -q clevis; then
-                        echo \"Found clevis in slot \$slot\"
-                        # Extract the JWE
                         luksmeta load -d '$ROOT_PART' -s \$slot > /mnt/etc/clevis-secrets/secret.jwe 2>/dev/null || true
                         break
                     fi
                 done
                 
-                # Verify we got the JWE
                 if [ -f /mnt/etc/clevis-secrets/secret.jwe ] && [ -s /mnt/etc/clevis-secrets/secret.jwe ]; then
                     echo 'JWE token extracted successfully'
                     chmod 600 /mnt/etc/clevis-secrets/secret.jwe
-                else
-                    echo 'Warning: Could not extract JWE token'
                 fi
-            " || warn "Could not extract JWE token, but binding should still work"
+            " || warn "Could not extract JWE token"
             
         } || {
-            warn "Clevis binding failed. This is often due to TPM access issues in the live environment."
-            warn "You can set it up after first boot."
+            warn "Clevis binding failed in live environment."
         }
         
         rm -rf "$CLEVIS_TMPDIR"
@@ -396,28 +457,30 @@ nixos-enter --root /mnt -c "chown -R $REGULAR_USER:users /home/$REGULAR_USER/nix
 # Also copy to root
 cp -r ~/nixos-config /mnt/root/nixos-config
 
-# Copy SOPS key to user's home if they need it
+# Copy SOPS key to user's home
 mkdir -p /mnt/home/"$REGULAR_USER"/.config/sops/age
 cp /root/.config/sops/age/keys.txt /mnt/home/"$REGULAR_USER"/.config/sops/age/keys.txt
 nixos-enter --root /mnt -c "chown -R $REGULAR_USER:users /home/$REGULAR_USER/.config" 2>/dev/null || true
 
-# Create post-install clevis setup script
-cat > /mnt/root/setup-clevis.sh << EOF
+# Create post-install scripts
+cat > /mnt/root/setup-clevis.sh << CLEVISEOF
 #!/usr/bin/env bash
 # Run this after first boot to set up Clevis TPM auto-decryption
 
 set -euo pipefail
 
 echo "Setting up Clevis for TPM auto-decryption..."
-echo "You will be prompted for your disk encryption password"
 
 # Ensure TPM modules are loaded
-sudo modprobe tpm_tis || true
-sudo modprobe tpm_crb || true
+sudo modprobe tpm_tis 2>/dev/null || true
+sudo modprobe tpm_crb 2>/dev/null || true
 
-# Try with PCR 7 (Secure Boot)
-if echo -n "\$DISK_PASSWORD" | sudo clevis luks bind -d $ROOT_PART tpm2 '{"pcr_ids":"7"}' -y; then
-    echo "✓ Success! Clevis bound to TPM with PCR 7"
+# Get encryption password
+read -sp "Enter disk encryption password: " DISK_PASSWORD
+echo
+
+if echo -n "\$DISK_PASSWORD" | sudo clevis luks bind -d $ROOT_PART tpm2 '{}' -y; then
+    echo "✓ Clevis bound to TPM"
     
     # Extract JWE token
     sudo mkdir -p /etc/clevis-secrets
@@ -427,77 +490,60 @@ if echo -n "\$DISK_PASSWORD" | sudo clevis luks bind -d $ROOT_PART tpm2 '{"pcr_i
             if [ -s /tmp/secret.jwe ]; then
                 sudo mv /tmp/secret.jwe /etc/clevis-secrets/secret.jwe
                 sudo chmod 600 /etc/clevis-secrets/secret.jwe
-                echo "✓ JWE token saved to /etc/clevis-secrets/secret.jwe"
+                echo "✓ JWE token saved"
                 break
             fi
         fi
     done
     
-    echo "✓ Auto-decryption should work on next boot"
-    echo "  Run 'sudo nixos-rebuild switch' to update initrd with new secrets"
+    echo "✓ Run 'sudo nixos-rebuild switch' to enable auto-unlock"
     exit 0
 fi
 
-# Fallback: try without PCR
-echo "PCR 7 failed, trying without PCR binding..."
-if echo -n "\$DISK_PASSWORD" | sudo clevis luks bind -d $ROOT_PART tpm2 '{}' -y; then
-    echo "✓ Success! Clevis bound to TPM (no PCR)"
-    echo "  Run 'sudo nixos-rebuild switch' to update initrd"
-    exit 0
-fi
-
-echo "✗ Failed to bind Clevis. Check that:"
-echo "  - TPM is enabled in BIOS"
-echo "  - Kernel modules are loaded (tpm_tis, tpm_crb)"
-echo "  - /dev/tpmrm0 or /dev/tpm0 exists"
+echo "✗ Failed to bind Clevis"
 exit 1
-EOF
+CLEVISEOF
 chmod +x /mnt/root/setup-clevis.sh
 
-# Setup git for SSH (reminder)
 cat > /mnt/root/setup-git-ssh.sh << 'EOF'
 #!/usr/bin/env bash
-# Run this after first boot to switch to SSH
 cd ~/nixos-config
 git remote set-url origin $(git remote get-url origin | sed 's|https://github.com/|git@github.com:|')
 echo "Git remote updated to use SSH"
 
-# Also update in user's home directory
 if [ -d /home/*/nixos-config ]; then
     for dir in /home/*/nixos-config; do
         cd "$dir"
         git remote set-url origin $(git remote get-url origin | sed 's|https://github.com/|git@github.com:|')
-        echo "Git remote updated to use SSH in $dir"
     done
 fi
 EOF
 chmod +x /mnt/root/setup-git-ssh.sh
 
-# Create debug info file
+# Create info file
 cat > /mnt/root/install-info.txt << EOF
-NixOS Installation Information
-==============================
+NixOS Installation
+==================
 Date: $(date)
 Hostname: $HOSTNAME
+Boot Mode: $BOOT_MODE
 Disk: $DISK
-Root Partition: $ROOT_PART
-Root UUID: $ROOT_UUID
-LUKS Name: $LUKS_NAME
-Swap Size: ${SWAP_GB}GB
-Clevis Bound: ${CLEVIS_BOUND}
+Root: $ROOT_PART (UUID: $ROOT_UUID)
+LUKS: $LUKS_NAME
+Swap: ${SWAP_GB}GB
+Clevis: ${CLEVIS_BOUND}
 
 SOPS Key: /root/.config/sops/age/keys.txt
 Config: /root/nixos-config
 
-$(if [ "$CLEVIS_BOUND" = true ]; then
-    echo "✓ Clevis auto-decryption is configured"
-    echo "  JWE token should be at: /etc/clevis-secrets/secret.jwe"
-else
-    echo "⚠ Clevis NOT set up during install"
-    echo "  To enable: sudo /root/setup-clevis.sh"
+$(if [ "$BOOT_MODE" = "bios" ]; then
+    echo "⚠ System installed in BIOS mode"
+    echo "  To use UEFI, enable it in BIOS and reinstall"
 fi)
 
-To manually unlock: cryptsetup open /dev/disk/by-uuid/$ROOT_UUID cryptroot
+$(if [ "$CLEVIS_BOUND" != true ]; then
+    echo "To enable auto-unlock: sudo /root/setup-clevis.sh"
+fi)
 EOF
 
 info ""
@@ -507,21 +553,21 @@ info "======================================"
 info ""
 info "Summary:"
 info "  - Hostname: $HOSTNAME"
-info "  - Root: $ROOT_PART (UUID: $ROOT_UUID)"
-info "  - Swap: ${SWAP_GB}GB"
+info "  - Boot mode: $BOOT_MODE"
+info "  - Root: $ROOT_PART"
 if [ "$CLEVIS_BOUND" = true ]; then
-    info "  - Clevis: ✓ CONFIGURED"
+    info "  - Clevis: ✓ Configured"
 else
-    info "  - Clevis: Not set up (run /root/setup-clevis.sh after boot)"
+    info "  - Clevis: Run /root/setup-clevis.sh after boot"
 fi
 info ""
 info "Next steps:"
 info "  1. Reboot"
+info "  2. Enter encryption password"
 if [ "$CLEVIS_BOUND" != true ]; then
-    info "  2. Enter encryption password at boot"
-    info "  3. Run: sudo /root/setup-clevis.sh"
+    info "  3. sudo /root/setup-clevis.sh"
 fi
-info "  4. Run: sudo /root/setup-git-ssh.sh"
+info "  4. sudo /root/setup-git-ssh.sh"
 info ""
 
 prompt "Reboot now? (y/N)"
