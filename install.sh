@@ -1,184 +1,168 @@
 #!/usr/bin/env bash
-
-set -e
+set -euo pipefail
 
 # Colors for output
 RED='\033[0;31m'
 GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
 BLUE='\033[0;34m'
-NC='\033[0m' # No Color
-
-log() {
-    echo -e "${GREEN}[INFO]${NC} $1"
-}
-
-warn() {
-    echo -e "${YELLOW}[WARN]${NC} $1"
-}
+NC='\033[0m'
 
 error() {
-    echo -e "${RED}[ERROR]${NC} $1"
+    echo -e "${RED}ERROR: $1${NC}" >&2
     exit 1
 }
 
+info() {
+    echo -e "${GREEN}INFO: $1${NC}"
+}
+
+warn() {
+    echo -e "${YELLOW}WARNING: $1${NC}"
+}
+
 prompt() {
-    echo -e "${BLUE}[PROMPT]${NC} $1"
+    echo -e "${BLUE}$1${NC}"
 }
 
-# Function to get user input
-get_input() {
-    local prompt="$1"
-    local var_name="$2"
-    local secret="${3:-false}"
-    
-    while true; do
-        if [ "$secret" = "true" ]; then
-            read -s -p "$prompt" value
-            echo
-        else
-            read -p "$prompt" value
-        fi
-        
-        if [ -n "$value" ]; then
-            eval "$var_name='$value'"
-            break
-        else
-            warn "Please enter a value."
-        fi
-    done
-}
+# Banner
+echo -e "${GREEN}"
+echo "=================================="
+echo "  NixOS Installation Script"
+echo "=================================="
+echo -e "${NC}"
 
-# Function to detect disks and let user choose
-choose_disk() {
-    log "Available disks:"
-    lsblk -d -n -o NAME,SIZE,MODEL | grep -E "^(sd|nvme|vd)" | nl -v 0
-    echo
-    
-    local disks=($(lsblk -d -n -o NAME | grep -E "^(sd|nvme|vd)"))
-    
-    while true; do
-        read -p "Select disk number: " disk_num
-        if [[ "$disk_num" =~ ^[0-9]+$ ]] && [ "$disk_num" -lt "${#disks[@]}" ]; then
-            DISK="/dev/${disks[$disk_num]}"
-            log "Selected disk: $DISK"
-            break
-        else
-            warn "Invalid selection. Please try again."
-        fi
-    done
-}
+# Prompt for GitHub repo
+prompt "Enter your GitHub repo URL (HTTPS):"
+read -r GITHUB_REPO
 
-# Function to setup disk encryption and partitioning
-setup_disks() {
-    log "Setting up disk partitioning and encryption..."
-    
-    # Unmount any existing mounts
-    umount -R /mnt 2>/dev/null || true
-    
-    # Wipe the disk
-    warn "This will completely erase $DISK!"
-    read -p "Are you sure? (yes/no): " confirm
-    if [ "$confirm" != "yes" ]; then
-        error "Aborted by user"
-    fi
-    
-    log "Wiping disk $DISK..."
-    wipefs -af "$DISK"
-    
-    # Create partition table
-    parted "$DISK" --script -- mklabel gpt
-    parted "$DISK" --script -- mkpart ESP fat32 1MiB 512MiB
-    parted "$DISK" --script -- set 1 esp on
-    parted "$DISK" --script -- mkpart primary 512MiB 100%
-    
-    # Set partition variables based on disk type
-    if [[ "$DISK" == *"nvme"* ]]; then
-        BOOT_PARTITION="${DISK}p1"
-        ROOT_PARTITION="${DISK}p2"
-    else
-        BOOT_PARTITION="${DISK}1"
-        ROOT_PARTITION="${DISK}2"
-    fi
-    
-    log "Boot partition: $BOOT_PARTITION"
-    log "Root partition: $ROOT_PARTITION"
-    
-    # Setup LUKS encryption
-    log "Setting up LUKS encryption..."
-    echo -n "$ENCRYPTION_PASSWORD" | cryptsetup luksFormat "$ROOT_PARTITION" -
-    echo -n "$ENCRYPTION_PASSWORD" | cryptsetup open "$ROOT_PARTITION" cryptroot -
-    
-    # Create filesystems
-    log "Creating filesystems..."
-    mkfs.fat -F 32 -n boot "$BOOT_PARTITION"
-    mkfs.ext4 -L nixos /dev/mapper/cryptroot
-    
-    # Mount filesystems
-    log "Mounting filesystems..."
-    mount /dev/mapper/cryptroot /mnt
-    mkdir -p /mnt/boot
-    mount "$BOOT_PARTITION" /mnt/boot
-    
-    # Create swapfile
-    log "Creating swapfile for hibernation..."
-    dd if=/dev/zero of=/mnt/swapfile bs=1M count=16384 status=progress
-    chmod 600 /mnt/swapfile
-    mkswap /mnt/swapfile
-    swapon /mnt/swapfile
-    
-    # Store partition info for later use
-    ROOT_UUID=$(blkid -s UUID -o value "$ROOT_PARTITION")
-    LUKS_NAME="luks-$ROOT_UUID"
-    
-    log "Root partition UUID: $ROOT_UUID"
-    log "LUKS name: $LUKS_NAME"
-}
+# Prompt for hostname
+prompt "Enter hostname for this machine:"
+read -r HOSTNAME
 
-# Function to generate initial NixOS configuration
-generate_nixos_config() {
-    log "Generating initial NixOS configuration..."
-    nixos-generate-config --root /mnt
-}
+# Prompt for user password
+prompt "Enter password for your user (will also be used for root):"
+read -sr USER_PASSWORD
+echo
+prompt "Confirm password:"
+read -sr USER_PASSWORD_CONFIRM
+echo
 
-# Function to clone and setup the configuration
-setup_config() {
-    log "Cloning NixOS configuration from $GITHUB_REPO..."
-    cd /mnt
-    git clone "$GITHUB_REPO" nixos-config
-    cd nixos-config
-    
-    # Check if hostname directory exists
-    if [ ! -d "hosts/$HOSTNAME" ]; then
-        error "Host directory 'hosts/$HOSTNAME' not found in the repository!"
-    fi
-    
-    log "Found host configuration for $HOSTNAME"
-    
-    # Replace hardware-configuration.nix
-    log "Updating hardware-configuration.nix..."
-    if [ -f "/mnt/etc/nixos/hardware-configuration.nix" ]; then
-        cp "/mnt/etc/nixos/hardware-configuration.nix" "hosts/$HOSTNAME/hardware-configuration.nix"
-    else
-        error "Generated hardware-configuration.nix not found!"
-    fi
-}
+[ "$USER_PASSWORD" = "$USER_PASSWORD_CONFIRM" ] || error "Passwords do not match!"
 
-# Function to update boot.nix with correct values
-update_boot_config() {
-    log "Updating boot.nix configuration..."
-    
-    # Find boot.nix file
-    BOOT_NIX_PATH=$(find "hosts/$HOSTNAME" -name "boot.nix" -type f | head -1)
-    
-    if [ -z "$BOOT_NIX_PATH" ]; then
-        error "boot.nix not found in hosts/$HOSTNAME"
-    fi
-    
-    log "Found boot.nix at: $BOOT_NIX_PATH"
-    
-    # Create new boot.nix content
-    cat > "$BOOT_NIX_PATH" << EOF
+# Prompt for encryption password
+prompt "Enter disk encryption password:"
+read -sr ENCRYPTION_PASSWORD
+echo
+prompt "Confirm encryption password:"
+read -sr ENCRYPTION_PASSWORD_CONFIRM
+echo
+
+[ "$ENCRYPTION_PASSWORD" = "$ENCRYPTION_PASSWORD_CONFIRM" ] || error "Encryption passwords do not match!"
+
+# Detect and select disk
+info "Available disks:"
+lsblk -dno NAME,SIZE,TYPE | grep disk
+
+prompt "Enter disk to install to (e.g., nvme0n1, sda):"
+read -r DISK_NAME
+DISK="/dev/$DISK_NAME"
+
+[ -b "$DISK" ] || error "Disk $DISK does not exist!"
+
+warn "This will ERASE ALL DATA on $DISK!"
+prompt "Type 'YES' to continue:"
+read -r CONFIRM
+[ "$CONFIRM" = "YES" ] || error "Installation cancelled"
+
+# Partition and encrypt disk
+info "Partitioning disk..."
+wipefs -af "$DISK"
+sgdisk --zap-all "$DISK"
+sgdisk -n 1:0:+512M -t 1:ef00 -c 1:boot "$DISK"
+sgdisk -n 2:0:0 -t 2:8300 -c 2:root "$DISK"
+
+# Determine partition naming
+if [[ "$DISK" == *"nvme"* ]] || [[ "$DISK" == *"mmcblk"* ]]; then
+    BOOT_PART="${DISK}p1"
+    ROOT_PART="${DISK}p2"
+else
+    BOOT_PART="${DISK}1"
+    ROOT_PART="${DISK}2"
+fi
+
+# Format boot partition
+info "Formatting boot partition..."
+mkfs.fat -F 32 -n BOOT "$BOOT_PART"
+
+# Encrypt root partition
+info "Encrypting root partition..."
+echo -n "$ENCRYPTION_PASSWORD" | cryptsetup luksFormat --type luks2 "$ROOT_PART" -
+echo -n "$ENCRYPTION_PASSWORD" | cryptsetup open "$ROOT_PART" cryptroot -
+
+# Format encrypted partition
+info "Formatting encrypted partition..."
+mkfs.ext4 -L nixos /dev/mapper/cryptroot
+
+# Get UUIDs
+ROOT_UUID=$(blkid -s UUID -o value "$ROOT_PART")
+LUKS_NAME="luks-${ROOT_UUID}"
+
+# Mount filesystems
+info "Mounting filesystems..."
+mount /dev/mapper/cryptroot /mnt
+mkdir -p /mnt/boot
+mount "$BOOT_PART" /mnt/boot
+
+# Create swap file
+info "Creating swap file for hibernation..."
+RAM_GB=$(free -g | awk '/^Mem:/{print $2}')
+SWAP_GB=$((RAM_GB + 2))
+dd if=/dev/zero of=/mnt/swapfile bs=1G count=$SWAP_GB status=progress
+chmod 600 /mnt/swapfile
+mkswap /mnt/swapfile
+swapon /mnt/swapfile
+
+# Generate initial config
+info "Generating initial NixOS configuration..."
+nixos-generate-config --root /mnt
+
+# Clone nixos-config
+info "Cloning nixos-config from $GITHUB_REPO..."
+git clone "$GITHUB_REPO" ~/nixos-config
+
+# Check hostname directory exists
+[ -d ~/nixos-config/hosts/"$HOSTNAME" ] || error "No configuration found for hostname '$HOSTNAME' in ~/nixos-config/hosts/"
+
+info "Found configuration for $HOSTNAME"
+
+# Setup rbw and extract SOPS key
+info "Setting up rbw for SOPS key extraction..."
+nix-shell -p rbw --run bash << 'RBWEOF'
+echo "Please log into rbw..."
+rbw login
+echo "Unlocking rbw..."
+rbw unlock
+
+echo "Extracting NixOS AGE Key..."
+mkdir -p /root/.config/sops/age
+rbw get "NixOS AGE Key" > /root/.config/sops/age/keys.txt
+chmod 600 /root/.config/sops/age/keys.txt
+echo "SOPS key extracted successfully!"
+RBWEOF
+
+# Update hardware-configuration.nix
+info "Updating hardware-configuration.nix..."
+cp /mnt/etc/nixos/hardware-configuration.nix ~/nixos-config/hosts/"$HOSTNAME"/hardware-configuration.nix
+
+# Find and update boot.nix
+info "Finding boot.nix..."
+BOOT_NIX=$(find ~/nixos-config/hosts/"$HOSTNAME" -name "boot.nix" -type f | head -n 1)
+
+[ -n "$BOOT_NIX" ] || error "boot.nix not found in ~/nixos-config/hosts/$HOSTNAME"
+
+info "Updating boot.nix at $BOOT_NIX..."
+cat > "$BOOT_NIX" << EOF
 # /hosts/$HOSTNAME/boot.nix
 let
   # The NEW, CORRECT values from your fresh install
@@ -188,7 +172,7 @@ in {
   swapDevices = [
     {
       device = "/swapfile";
-      size = 16;
+      size = $SWAP_GB * 1024;  # Size in MB
     }
   ];
 
@@ -196,125 +180,62 @@ in {
   # and generate the correct boot.initrd.luks.devices and boot.initrd.clevis.devices.
   custom.boot.luksPartitions = {
     root = {
-      luksName = \${${HOSTNAME}RootLuksName};
-      devicePath = \${${HOSTNAME}RootLuksDevicePath};
+      luksName = ${HOSTNAME}RootLuksName;
+      devicePath = ${HOSTNAME}RootLuksDevicePath;
     };
   };
 }
 EOF
-    
-    log "Updated boot.nix with correct LUKS values"
-}
 
-# Function to setup SOPS with rbw
-setup_sops() {
-    log "Setting up SOPS with rbw..."
-    
-    # Install rbw in nix-shell
-    log "Installing rbw..."
-    nix-shell -p rbw --run "
-        log 'Please log into rbw:'
-        rbw login
-        rbw sync
-        
-        log 'Extracting NixOS AGE Key...'
-        mkdir -p /root/.config/sops/age
-        rbw get 'NixOS AGE Key' > /root/.config/sops/age/keys.txt
-        
-        if [ ! -s /root/.config/sops/age/keys.txt ]; then
-            error 'Failed to extract AGE key from rbw'
-        fi
-        
-        log 'AGE key successfully extracted'
-    "
-}
+info "boot.nix updated successfully!"
 
-# Function to setup clevis auto-decryption
-setup_clevis() {
-    log "Setting up Clevis for auto-decryption..."
-    
-    # This will be handled by your NixOS configuration
-    # Just noting it here for the rebuild process
-    warn "Clevis setup will be handled during NixOS rebuild"
-    warn "Make sure your configuration includes the necessary clevis modules"
-}
+# Setup Clevis for TPM auto-decryption
+info "Setting up Clevis for TPM-based auto-decryption..."
+nix-shell -p clevis luksmeta cryptsetup --run "
+    echo -n '$ENCRYPTION_PASSWORD' | clevis luks bind -d '$ROOT_PART' tpm2 '{}' -y
+"
 
-# Function to rebuild NixOS
-rebuild_nixos() {
-    log "Rebuilding NixOS..."
-    cd /mnt/nixos-config
-    
-    # Set root password
-    echo "root:$PASSWORD" | chpasswd
-    
-    # Install NixOS with flakes
-    log "Installing NixOS with flakes..."
-    nixos-install --flake ".#$HOSTNAME" --no-root-passwd
-    
-    log "Setting user password in chroot..."
-    nixos-enter --root /mnt -c "echo '$USERNAME:$PASSWORD' | chpasswd"
-}
+info "Clevis TPM binding complete!"
 
-# Function to setup cryptenroll (post-install)
-setup_cryptenroll() {
-    log "Setting up systemd-cryptenroll..."
-    
-    nixos-enter --root /mnt -c "
-        # Enroll TPM2 for auto-unlock
-        if command -v systemd-cryptenroll >/dev/null 2>&1; then
-            systemd-cryptenroll --tpm2-device=auto --tpm2-pcrs=0+2+7 $ROOT_PARTITION
-            log 'TPM2 enrollment completed'
-        else
-            warn 'systemd-cryptenroll not available, skipping TPM enrollment'
-        fi
-    "
-}
+# Install NixOS
+info "Installing NixOS with flake configuration..."
+nixos-install --flake ~/nixos-config#"$HOSTNAME" --root /mnt --no-root-passwd
 
-# Main script execution
-main() {
-    log "Starting NixOS installation script..."
-    
-    # Get user inputs
-    get_input "GitHub repository URL (https): " GITHUB_REPO
-    get_input "Hostname: " HOSTNAME
-    get_input "Username: " USERNAME  
-    get_input "Password (will be used for both user and root): " PASSWORD true
-    get_input "Disk encryption password: " ENCRYPTION_PASSWORD true
-    
-    # Choose disk
-    choose_disk
-    
-    # Confirm settings
-    echo
-    log "Configuration Summary:"
-    echo "Repository: $GITHUB_REPO"
-    echo "Hostname: $HOSTNAME"
-    echo "Username: $USERNAME"
-    echo "Disk: $DISK"
-    echo
-    read -p "Proceed with installation? (yes/no): " confirm
-    if [ "$confirm" != "yes" ]; then
-        error "Installation aborted"
-    fi
-    
-    # Execute installation steps
-    setup_disks
-    generate_nixos_config
-    setup_config
-    setup_sops
-    update_boot_config
-    rebuild_nixos
-    setup_cryptenroll
-    
-    log "Installation completed successfully!"
-    log "You can now reboot into your new NixOS system"
-    log "Remember to change your git remote to SSH after first boot"
-    
-    warn "Post-installation TODO:"
-    echo "1. Change git remote to SSH in ~/nixos-config"
-    echo "2. Verify Clevis auto-decryption is working"
-    echo "3. Test hibernation with the swapfile"
-}
+# Set passwords
+info "Setting passwords..."
+echo "root:$USER_PASSWORD" | nixos-enter --root /mnt -c 'chpasswd'
 
-# Run main function
-main "$@"
+# Copy nixos-config to installed system
+info "Copying nixos-config to installed system..."
+cp -r ~/nixos-config /mnt/root/nixos-config
+
+# Setup git for SSH (reminder)
+cat > /mnt/root/setup-git-ssh.sh << 'EOF'
+#!/usr/bin/env bash
+# Run this after first boot to switch to SSH
+cd ~/nixos-config
+git remote set-url origin $(git remote get-url origin | sed 's|https://github.com/|git@github.com:|')
+echo "Git remote updated to use SSH"
+EOF
+chmod +x /mnt/root/setup-git-ssh.sh
+
+info ""
+info "======================================"
+info "  Installation Complete!"
+info "======================================"
+info ""
+info "Summary:"
+info "  - Hostname: $HOSTNAME"
+info "  - Encrypted root: $ROOT_PART (UUID: $ROOT_UUID)"
+info "  - Swap file: ${SWAP_GB}GB"
+info "  - TPM auto-decryption: Enabled"
+info ""
+info "Next steps:"
+info "  1. Reboot into your new system"
+info "  2. Run: /root/setup-git-ssh.sh"
+info "  3. Verify auto-decryption works"
+info ""
+
+prompt "Press Enter to reboot or Ctrl+C to cancel..."
+read -r
+reboot
